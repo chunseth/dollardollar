@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="First Dollar — a founder operating dashboard." />
+    <title>First Dollar — Founder OS</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=Playfair+Display:ital,wght@0,600;0,700;1,600&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="overrides.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="#today" data-view-link="today"><span class="brand-mark">$</span><span>First Dollar</span></a>
+        <button class="project-switcher" type="button" data-action="toggle-project-menu"><span class="avatar">AB</span><span><strong>Loading project</strong><small>Database memory</small></span><span class="chevron">⌄</span></button>
+        <div class="project-menu hidden" id="projectMenu"><p>ACTIVE PROJECTS</p><button type="button" class="current-project">Loading project <small>Database memory</small></button><button type="button" data-action="new-project">+ Start a new project</button></div>
+        <nav aria-label="Main navigation">
+          <a class="nav-link active" href="#today" data-view-link="today"><span>◫</span>Today</a>
+          <a class="nav-link" href="#memory" data-view-link="memory"><span>▤</span>Company memory</a>
+          <a class="nav-link" href="#assumptions" data-view-link="assumptions"><span>◇</span>Assumptions <b id="riskCount">3</b></a>
+          <a class="nav-link" href="#evidence" data-view-link="evidence"><span>◌</span>Evidence</a>
+          <a class="nav-link" href="#experiments" data-view-link="experiments"><span>⌁</span>Experiments</a>
+          <a class="nav-link" href="#tasks" data-view-link="tasks"><span>✓</span>Tasks <b id="taskCount">4</b></a>
+        </nav>
+        <div class="sidebar-bottom"><div class="founder"><span class="avatar founder-avatar">SC</span><span><strong>Sarah Chen</strong><small>Founder</small></span><button aria-label="Settings">•••</button></div></div>
+      </aside>
+      <main id="app" tabindex="-1"></main>
+    </div>
+    <div class="toast" id="toast" role="status"></div>
+    <script src="app.js"></script>
+  </body>
+</html>

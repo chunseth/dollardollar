@@ -1,0 +1,2 @@
+const fs = require("fs"); const path = require("path"); const { pool } = require("../db");
+(async () => { try { const migrations = fs.readdirSync(path.join(__dirname, "../migrations")).filter(f => f.endsWith(".sql")).sort(); for (const file of migrations) { console.log(`Applying ${file}`); await pool.query(fs.readFileSync(path.join(__dirname, "../migrations", file), "utf8")); } console.log("Migrations complete."); } finally { await pool.end(); } })().catch(error => { console.error(error); process.exit(1); });

@@ -1,0 +1,14 @@
+{
+  "name": "first-dollar",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test && node --check app.js && node --check server.js && node --check scripts/seed.js",
+    "db:migrate": "node scripts/migrate.js",
+    "db:seed": "node scripts/seed.js"
+  },
+  "dependencies": {
+    "pg": "^8.16.3"
+  }
+}
