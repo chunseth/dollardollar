@@ -4,7 +4,11 @@ CREATE TABLE IF NOT EXISTS projects (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id text NOT NULL, name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 160),
   short_description text, long_description text, stage text NOT NULL DEFAULT 'idea', status text NOT NULL DEFAULT 'active',
   target_customer text, problem_statement text, solution_summary text, revenue_model text, pricing_hypothesis text,
-  validation_stage text, project_memory_summary text, founder_goal text, founder_constraints text,
+  validation_stage text, project_memory_summary text, founder_goal text, founder_constraints text, first_dollar_path jsonb NOT NULL DEFAULT '{}'::jsonb,
+  primary_industry text CHECK (primary_industry IN ('saas','marketplace','education','local_service','ecommerce','healthcare','other')),
+  secondary_industry text CHECK (secondary_industry IN ('saas','marketplace','education','local_service','ecommerce','healthcare','other')),
+  industry_confidence text CHECK (industry_confidence IN ('high','medium','low')), industry_rationale text,
+  industry_details jsonb NOT NULL DEFAULT '{}'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS decisions (

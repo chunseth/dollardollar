@@ -2,7 +2,7 @@
 
 ## Local development
 
-Milestone 2 uses Postgres for all company-memory records. Copy `.env.example` into your shell environment, then run:
+Milestone 3 uses Postgres for company memory and a server-only OpenAI key for onboarding drafts. Export the values from `.env.example` into your shell environment, then run:
 
 ```sh
 npm install
@@ -10,7 +10,7 @@ npm run db:migrate
 npm start
 ```
 
-The app reads and writes through `/api/projects/:projectId/...`; `DATABASE_URL` is required to start the server. The browser does not load `mock-data.js`.
+The app reads and writes through `/api/projects/:projectId/...`; `DATABASE_URL` and `OPENAI_API_KEY` are required to start the server. The browser does not load `mock-data.js`, does not call OpenAI, and never receives the API key. Onboarding drafts are editable and no profile field, assumption, or task is persisted until confirmed.
 
 ## Mission
 
