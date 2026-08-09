@@ -16,7 +16,7 @@ const editable = {
   decision: new Set(["title", "decision", "reason", "status", "decided_at", "source_ids", "provenance"])
 };
 const tableFor = { belief: "beliefs", evidence: "evidence", task: "tasks", experiment: "experiments", decision: "decisions" };
-const fail = message => { const error = new Error(message); error.code = "INVALID_CHANGE_SET"; return error; };
+const fail = message => { const error = new Error(message); error.code = "INVALID_CHANGE_SET"; error.status = 422; return error; };
 const object = value => value && typeof value === "object" && !Array.isArray(value);
 const nonEmpty = value => typeof value === "string" && value.trim().length > 0;
 const executor = value => value && typeof value.query === "function";

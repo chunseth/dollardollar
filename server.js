@@ -6,6 +6,7 @@ const { query, transaction } = require("./db");
 const { createDraft, createPlan, normalizeDraft, fields: onboardingFields, industries, industryModules, revenuePathFields, projectTitle } = require("./onboarding");
 const { buildProjectContext } = require("./context");
 const { createBeliefFromAssumption, appendBeliefVersion, linkEvidenceToBeliefVersion } = require("./beliefs");
+const { proposeChangeSet, approveChangeSet, approveChangeSetItems, rejectChangeSet, editChangeSetItem, getPendingChangeSetsForProject, applyApprovedChangeSet } = require("./change_sets");
 
 const root = __dirname;
 const types = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8" };
@@ -137,6 +138,31 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
   if (parts.length === 2 && method === "GET") return send(response, 200, { projects: (await query("SELECT * FROM projects WHERE user_id=$1 ORDER BY updated_at DESC", [owner])).rows });
   if (parts.length === 2 && method === "POST") { const body = await readBody(request); const values = pick(body, projectFields), errors = validateProject(values); if (!values.name || !String(values.name).trim() || errors) return fail(response, 422, "Invalid project", { ...(!values.name || !String(values.name).trim() ? { name: "is required" } : {}), ...(errors || {}) }); const result = await transaction(async client => { const fields = ["user_id", ...Object.keys(values)], params = [owner, ...Object.values(values)]; const row = (await client.query(`INSERT INTO projects (${fields.join(",")}) VALUES (${fields.map((_, i) => `$${i + 1}`).join(",")}) RETURNING *`, params)).rows[0]; await log(client, row.id, "founder", "created", "project", row.id, `Created project ${row.name}`, values); return row; }); return send(response, 201, { project: result }); }
   const projectId = parts[2], existingProject = validUuid(projectId) ? await ownedProject(projectId, owner) : null; if (!existingProject) return fail(response, 404, "Project not found");
+  if (parts[3] === "change-sets") {
+    const context = { actor_id: owner, project_id: projectId };
+    if (parts.length === 4 && method === "GET") return send(response, 200, { change_sets: await getPendingChangeSetsForProject(projectId, context) });
+    if (parts.length === 4 && method === "POST") {
+      const body = await readBody(request);
+      return send(response, 201, { change_set: await proposeChangeSet(projectId, body) });
+    }
+    const changeSetId = parts[4];
+    if (!changeSetId) return fail(response, 404, "Change set not found");
+    if (parts.length === 6 && parts[5] === "approve" && method === "POST") return send(response, 200, { change_set: await approveChangeSet(projectId, changeSetId, context) });
+    if (parts.length === 6 && parts[5] === "approve-items" && method === "POST") {
+      const body = await readBody(request);
+      return send(response, 200, { change_set: await approveChangeSetItems(projectId, changeSetId, body.item_ids, context) });
+    }
+    if (parts.length === 6 && parts[5] === "reject" && method === "POST") {
+      const body = await readBody(request);
+      return send(response, 200, { change_set: await rejectChangeSet(projectId, changeSetId, context, body.reason || null) });
+    }
+    if (parts.length === 6 && parts[5] === "apply" && method === "POST") return send(response, 200, { change_set: await applyApprovedChangeSet(projectId, changeSetId, context) });
+    if (parts.length === 8 && parts[5] === "items" && parts[7] === "edit" && method === "PATCH") {
+      const body = await readBody(request);
+      return send(response, 200, { item: await editChangeSetItem(projectId, changeSetId, parts[6], body.payload, context) });
+    }
+    return fail(response, 404, "Change-set route not found");
+  }
   if (parts[3] === "chat" && parts.length === 4 && method === "GET") return send(response, 200, { turns: await chatHistory(projectId) });
   if (parts[3] === "recommendation" && parts.length === 4 && method === "GET") {
     const recommendation = (await query("SELECT id, context_packet_id, recommendation, created_at FROM recommendations WHERE project_id=$1 AND status='active' ORDER BY created_at DESC LIMIT 1", [projectId])).rows[0];
