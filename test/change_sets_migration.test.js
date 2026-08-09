@@ -27,6 +27,7 @@ function createStore() {
   const query = async (sql, params = []) => {
     const text = sql.replace(/\s+/g, " ").trim().toLowerCase();
     state.calls.push({ text, params: clone(params) });
+    if (text.startsWith("select user_id from projects")) return result([{ user_id: "founder-1" }]);
     if (text.startsWith("select id from projects")) return result([{ id: params[0] }]);
     if (text.startsWith("select id from conversation_turns")) return result(params[0] === "turn-1" ? [{ id: "turn-1" }] : []);
     if (text.startsWith("select * from assumptions") || text.startsWith("select * from evidence") || text.startsWith("select * from tasks where project_id") || text.startsWith("select * from experiments") || text.startsWith("select ae.* from assumption_evidence")) return result([]);
@@ -64,7 +65,7 @@ function createStore() {
     if (text.startsWith("update change_sets set status='applied'")) { const set = state.sets.find(candidate => candidate.id === params[0]); set.status = "applied"; set.application_metadata = params[2]; return result([set]); }
     if (text.startsWith("update change_sets set status='failed'")) { const set = state.sets.find(candidate => candidate.id === params[0] && candidate.project_id === params[2] && ["approved", "applying"].includes(candidate.status)); if (!set) return result([]); set.status = "failed"; set.application_metadata = { ...set.application_metadata, ...JSON.parse(params[1]) }; return result([set]); }
     if (text.startsWith("insert into tasks")) { if (params.includes("__FAIL__")) throw new Error("forced task insert failure"); const task = { id: `task-${state.nextTask++}`, project_id: params[0], title: params[1] }; state.tasks.push(task); return result([task]); }
-    if (text.startsWith("insert into event_log")) { const event = { project_id: params[0], actor_id: params[1], event_type: params[2], entity_type: params[3], entity_id: params[4], payload: params[6] }; state.events.push(event); return result([event]); }
+    if (text.startsWith("insert into event_log")) { const event = { project_id: params[0], actor_type: params[1], actor_id: params[2], event_type: params[3], entity_type: params[4], entity_id: params[5], payload: params[7] }; state.events.push(event); return result([event]); }
     throw new Error(`Unhandled test query: ${text}`);
   };
   return {
@@ -86,18 +87,21 @@ const proposal = (key, title = "Call five founders") => ({ source_turn_id: "turn
 test("change-set proposal validation and idempotency are deterministic", async () => {
   const store = createStore(), service = loadService(store);
   await assert.rejects(() => service.proposeChangeSet("project-1", { ...proposal("bad"), items: [{ record_type: "evidence", operation: "create", payload: { source_ids: ["turn-1"] } }] }), /Evidence proposals require/);
+  await assert.rejects(() => service.proposeChangeSet("project-1", { ...proposal("bad-link"), items: [{ record_type: "task", operation: "link", target_entity_id: "task-1", payload: { source_ids: ["turn-1"] } }] }), /Link operations are only supported/);
   const created = await service.proposeChangeSet("project-1", proposal("same-key"));
   const reused = await service.proposeChangeSet("project-1", proposal("same-key"));
   assert.equal(created.reused, false);
   assert.equal(reused.reused, true);
   assert.equal(store.state.sets.length, 1);
   assert.deepEqual(store.state.events.map(event => event.event_type), ["proposed"]);
+  assert.equal(store.state.events[0].actor_type, "ai");
 });
 
 test("founder review workflow enforces authorization, edit, selected approval, full approval, and rejection", async () => {
   const store = createStore(), service = loadService(store);
   const set = await service.proposeChangeSet("project-1", { ...proposal("review"), items: [proposal("a").items[0], proposal("b", "Send follow-up").items[0]] });
   await assert.rejects(() => service.approveChangeSet("project-1", set.id), /Founder authorization context is required/);
+  await assert.rejects(() => service.approveChangeSet("project-1", set.id, { actor_id: "someone-else" }), /not authorized/);
   await service.editChangeSetItem("project-1", set.id, set.items[1].id, { title: "Send a tailored follow-up", source_ids: ["turn-1"], justification: "Keeps the proposal focused." }, { actor_id: "founder-1" });
   const partial = await service.approveChangeSetItems("project-1", set.id, [set.items[0].id], { actor_id: "founder-1" });
   assert.equal(partial.status, "partially_approved");
