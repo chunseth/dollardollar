@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const { query, transaction } = require("./db");
 const { createDraft, createPlan, normalizeDraft, fields: onboardingFields, industries, industryModules, revenuePathFields, projectTitle } = require("./onboarding");
+const { buildProjectContext } = require("./context");
 
 const root = __dirname;
 const types = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8" };
@@ -50,11 +51,21 @@ function validateProject(values, currentIndustry = "") {
 async function readBody(request) { let body = ""; for await (const chunk of request) { body += chunk; if (body.length > 1_000_000) throw new Error("Request body is too large"); } try { return body ? JSON.parse(body) : {}; } catch { const error = new Error("Request body must be valid JSON"); error.status = 400; throw error; } }
 async function log(client, projectId, actorType, eventType, entityType, entityId, summary, payload = {}) { await client.query("INSERT INTO event_log (project_id, actor_type, event_type, entity_type, entity_id, summary, payload) VALUES ($1,$2,$3,$4,$5,$6,$7)", [projectId, actorType, eventType, entityType, entityId, summary, payload]); }
 async function ownedProject(projectId, owner) { const result = await query("SELECT * FROM projects WHERE id=$1 AND user_id=$2", [projectId, owner]); return result.rows[0]; }
-async function fullMemory(projectId) {
-  const [project, assumptions, evidence, experiments, tasks, decisions, milestones, links, events] = await Promise.all([
-    query("SELECT * FROM projects WHERE id=$1", [projectId]), query("SELECT * FROM assumptions WHERE project_id=$1 ORDER BY risk_score DESC, created_at", [projectId]), query("SELECT * FROM evidence WHERE project_id=$1 ORDER BY created_at DESC", [projectId]), query("SELECT * FROM experiments WHERE project_id=$1 ORDER BY created_at DESC", [projectId]), query("SELECT * FROM tasks WHERE project_id=$1 ORDER BY created_at", [projectId]), query("SELECT * FROM decisions WHERE project_id=$1 ORDER BY created_at DESC", [projectId]), query("SELECT * FROM roadmap_milestones WHERE project_id=$1 ORDER BY position", [projectId]), query("SELECT ae.* FROM assumption_evidence ae JOIN evidence e ON e.id=ae.evidence_id WHERE e.project_id=$1", [projectId]), query("SELECT * FROM event_log WHERE project_id=$1 ORDER BY created_at DESC LIMIT 50", [projectId])
-  ]);
-  return { project: project.rows[0], assumptions: assumptions.rows, evidence: evidence.rows, experiments: experiments.rows, tasks: tasks.rows, decisions: decisions.rows, roadmap_milestones: milestones.rows, assumption_evidence: links.rows, events: events.rows };
+async function fullMemory(projectId, executor = { query }, includeConversation = false) {
+  const project = await executor.query("SELECT * FROM projects WHERE id=$1", [projectId]);
+  const assumptions = await executor.query("SELECT * FROM assumptions WHERE project_id=$1 ORDER BY risk_score DESC, created_at", [projectId]);
+  const evidence = await executor.query("SELECT * FROM evidence WHERE project_id=$1 ORDER BY created_at DESC", [projectId]);
+  const experiments = await executor.query("SELECT * FROM experiments WHERE project_id=$1 ORDER BY created_at DESC", [projectId]);
+  const tasks = await executor.query("SELECT * FROM tasks WHERE project_id=$1 ORDER BY created_at", [projectId]);
+  const decisions = await executor.query("SELECT * FROM decisions WHERE project_id=$1 ORDER BY created_at DESC", [projectId]);
+  const milestones = await executor.query("SELECT * FROM roadmap_milestones WHERE project_id=$1 ORDER BY position", [projectId]);
+  const links = await executor.query("SELECT ae.* FROM assumption_evidence ae JOIN evidence e ON e.id=ae.evidence_id WHERE e.project_id=$1", [projectId]);
+  const events = await executor.query("SELECT * FROM event_log WHERE project_id=$1 ORDER BY created_at DESC LIMIT 50", [projectId]);
+  const memory = { project: project.rows[0], assumptions: assumptions.rows, evidence: evidence.rows, experiments: experiments.rows, tasks: tasks.rows, decisions: decisions.rows, roadmap_milestones: milestones.rows, assumption_evidence: links.rows, events: events.rows };
+  if (!includeConversation) return memory;
+  const recommendation = await executor.query("SELECT id, context_packet_id, recommendation, created_at FROM recommendations WHERE project_id=$1 AND status='active' ORDER BY created_at DESC, id DESC LIMIT 1", [projectId]);
+  const conversationTurns = await executor.query("SELECT id, session_id, turn_no, actor_type, content, created_at FROM conversation_turns WHERE project_id=$1 ORDER BY created_at DESC, turn_no DESC, id DESC LIMIT 20", [projectId]);
+  return { ...memory, latest_recommendation: recommendation.rows[0] || null, conversation_turns: conversationTurns.rows };
 }
 
 const chatPromptVersion = "conversation-loop-v1";
@@ -135,9 +146,9 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
     const result = await transaction(async client => {
       let session = (await client.query("SELECT id FROM conversation_sessions WHERE project_id=$1 AND status='open' ORDER BY created_at DESC LIMIT 1 FOR UPDATE", [projectId])).rows[0];
       if (!session) session = (await client.query("INSERT INTO conversation_sessions (project_id, initiated_by) VALUES ($1,'founder') RETURNING id", [projectId])).rows[0];
-      const memory = await fullMemory(projectId);
-      const includedMemoryRecordIds = memoryRecordIds(memory);
-      const contextPacket = (await client.query("INSERT INTO context_packets (project_id,purpose,data,included_memory_record_ids) VALUES ($1,'chat_turn',$2,$3) RETURNING *", [projectId, { project: memory.project, memory_record_ids: includedMemoryRecordIds }, includedMemoryRecordIds])).rows[0];
+      const memory = await fullMemory(projectId, client, true);
+      const packet = buildProjectContext(memory);
+      const contextPacket = (await client.query("INSERT INTO context_packets (project_id,purpose,data,included_memory_record_ids) VALUES ($1,'chat_turn',$2,$3) RETURNING *", [projectId, packet.data, packet.included_memory_record_ids])).rows[0];
       const nextTurn = (await client.query("SELECT COALESCE(MAX(turn_no),0)+1 AS turn_no FROM conversation_turns WHERE session_id=$1", [session.id])).rows[0].turn_no;
       const founderTurn = (await client.query("INSERT INTO conversation_turns (session_id,project_id,context_packet_id,turn_no,actor_type,content) VALUES ($1,$2,$3,$4,'founder',$5) RETURNING *", [session.id, projectId, contextPacket.id, nextTurn, body.message.trim()])).rows[0];
       const payload = validateAssistantPayload(await generateAssistant({ project: existingProject, message: founderTurn.content, contextPacket, founderTurn }));
@@ -208,4 +219,4 @@ function startupGuard() {
 
 if (require.main === module) { startupGuard(); createServer().listen(port, () => console.log(`First Dollar is running at http://localhost:${port}`)); }
 
-module.exports = { createServer, startupGuard, placeholderAssistant, validateAssistantPayload, memoryRecordIds };
+module.exports = { createServer, startupGuard, placeholderAssistant, validateAssistantPayload, memoryRecordIds, fullMemory };
