@@ -5,6 +5,7 @@
 const crypto = require("crypto");
 const { query, transaction } = require("./db");
 const { buildContextPacket } = require("./context");
+const { persistRecommendation } = require("./recommendations");
 const { validateCofounderOutput } = require("./ai_cofounder_contract");
 const { proposeChangeSet } = require("./change_sets");
 
@@ -14,17 +15,12 @@ const safeMessage = "I saved your message, but I could not produce a validated c
 // This is intentionally local and deterministic.  A caller must inject a
 // model seam to get a substantive response; Phase 6 never makes a live call.
 async function callCofounderModel({ contextPacket, founderTurn }) {
+  const recommendation = contextPacket.data?.deterministic_recommendation || { state: "question", primary_issue: "The next validation detail is unclear", reason: "A specific result or blocker is needed to choose the next action.", action_payload: {}, confidence: 1, source_ids: [] };
   return {
-    assistant_message: "I saved your update. What is the most important result or blocker to clarify next?",
+    assistant_message: `I saved your update. ${recommendation.reason}`,
     proposed_belief_updates: [],
     proposed_records: [],
-    recommendation: {
-      state: "question",
-      primary_issue: "The next validation detail is unclear",
-      reason: "A specific result or blocker is needed to choose the next action.",
-      action_payload: {}, confidence: 0.2,
-      source_ids: [contextPacket.id, founderTurn.id]
-    },
+    recommendation: { ...recommendation, source_ids: [contextPacket.id, founderTurn.id] },
     needs_founder_review: true,
     model: "local-phase-6", prompt_version: promptVersion
   };
@@ -48,7 +44,7 @@ function modelError(code, error) {
   return { code, message: safeMessage, detail: error?.message || "Cofounder response unavailable" };
 }
 
-function normalizeCofounderOutput(raw, contextPacket, founderTurn) {
+function normalizeCofounderOutput(raw, contextPacket, founderTurn, plan = null) {
   // Retain compatibility with the old injected generateAssistant envelope
   // while making the Phase 1 object the only persisted structured payload.
   const output = raw?.structured_payload && raw?.assistant_message && raw?.recommendation ? {
@@ -80,6 +76,19 @@ function normalizeCofounderOutput(raw, contextPacket, founderTurn) {
   for (const item of normalized.proposed_belief_updates || []) attachProvenance(item);
   for (const item of normalized.proposed_records || []) attachProvenance(item);
   validateCofounderOutput(normalized);
+  // The model may shape wording/action only. Ranking, selected issue, and
+  // state are deterministic policy and cannot be redirected by model output.
+  const deterministic = plan?.recommendation || contextPacket.data?.deterministic_recommendation;
+  if (deterministic) {
+    normalized.recommendation = {
+      state: deterministic.state,
+      primary_issue: deterministic.primary_issue,
+      reason: normalized.recommendation.reason,
+      action_payload: normalized.recommendation.action_payload,
+      confidence: deterministic.confidence,
+      source_ids: deterministic.source_ids
+    };
+  }
   return normalized;
 }
 
@@ -119,12 +128,11 @@ function idempotencyKey(projectId, output, contextPacket, founderTurn, retryKey 
   return `phase6:${crypto.createHash("sha256").update(stableJson(identity)).digest("hex")}`;
 }
 
-async function persistAssistantResponse(projectId, saved, output, userId) {
+async function persistAssistantResponse(projectId, saved, output, userId, plan) {
   return transaction(async client => {
     const assistantTurn = (await client.query("INSERT INTO conversation_turns (session_id,project_id,context_packet_id,turn_no,actor_type,content,model,prompt_version,structured_payload) VALUES ($1,$2,$3,$4,'ai',$5,$6,$7,$8) RETURNING *", [saved.sessionId, projectId, saved.contextPacket.id, saved.nextTurn, output.assistant_message, output.model, output.prompt_version, output])).rows[0];
     await client.query("INSERT INTO event_log (project_id,actor_type,actor_id,event_type,entity_type,entity_id,summary,payload) VALUES ($1,'ai',$2,'created','conversation_turn',$3,$4,$5)", [projectId, userId, assistantTurn.id, "Saved AI chat turn", { context_packet_id: saved.contextPacket.id, turn_no: assistantTurn.turn_no, model: output.model, prompt_version: output.prompt_version }]);
-    await client.query("UPDATE recommendations SET status='superseded' WHERE project_id=$1 AND status='active'", [projectId]);
-    const recommendation = (await client.query("INSERT INTO recommendations (project_id,context_packet_id,recommendation) VALUES ($1,$2,$3) RETURNING id, context_packet_id, recommendation, created_at", [projectId, saved.contextPacket.id, output.recommendation])).rows[0];
+    const recommendation = await persistRecommendation(client, projectId, saved.contextPacket, plan, output.recommendation);
     return { assistantTurn, recommendation };
   });
 }
@@ -132,20 +140,31 @@ async function persistAssistantResponse(projectId, saved, output, userId) {
 async function handleFounderMessage(projectId, userId, message, options = {}) {
   if (typeof message !== "string" || !message.trim()) throw Object.assign(new Error("Chat message is required"), { status: 422 });
   const saved = await persistConversationTurn(projectId, message.trim(), userId);
-  let raw;
+  // The full ranking is persisted in the context packet, and its deterministic
+  // result is the canonical recommendation source for this chat turn.
+  const plan = {
+    recommendation: { ...saved.contextPacket.data.deterministic_recommendation, issue: saved.contextPacket.data.top_unresolved_issue || null },
+    ranked_issues: saved.contextPacket.data.ranked_unresolved_issues || [],
+    selected_issue: saved.contextPacket.data.top_unresolved_issue || null
+  };
+  let raw, fallbackError = null;
   try {
     raw = await (options.callCofounderModel || callCofounderModel)({ projectId, userId, message: saved.founderTurn.content, contextPacket: saved.contextPacket, founderTurn: saved.founderTurn });
   } catch (error) {
-    return { founder_turn: saved.founderTurn, assistant_turn: null, context_packet: saved.contextPacket, recommendation: null, error: modelError("model_failure", error) };
+    fallbackError = modelError("model_failure", error);
+    raw = { assistant_message: safeMessage, proposed_belief_updates: [], proposed_records: [], recommendation: saved.contextPacket.data.deterministic_recommendation, needs_founder_review: false, model: "deterministic-fallback", prompt_version: promptVersion };
   }
   let output;
   try {
-    output = normalizeCofounderOutput(raw, saved.contextPacket, saved.founderTurn);
+    output = normalizeCofounderOutput(raw, saved.contextPacket, saved.founderTurn, plan);
   } catch (error) {
-    return { founder_turn: saved.founderTurn, assistant_turn: null, context_packet: saved.contextPacket, recommendation: null, error: modelError("invalid_model_output", error) };
+    fallbackError = modelError("invalid_model_output", error);
+    output = { assistant_message: safeMessage, proposed_belief_updates: [], proposed_records: [], recommendation: saved.contextPacket.data.deterministic_recommendation, needs_founder_review: false, model: "deterministic-fallback", prompt_version: promptVersion };
+    output = normalizeCofounderOutput(output, saved.contextPacket, saved.founderTurn, plan);
   }
-  const persisted = await persistAssistantResponse(projectId, saved, output, userId);
-  const result = { founder_turn: saved.founderTurn, assistant_turn: persisted.assistantTurn, context_packet: saved.contextPacket, recommendation: persisted.recommendation };
+  output = output || normalizeCofounderOutput(raw, saved.contextPacket, saved.founderTurn, plan);
+  const persisted = await persistAssistantResponse(projectId, saved, output, userId, plan);
+  const result = { founder_turn: saved.founderTurn, assistant_turn: persisted.assistantTurn, context_packet: saved.contextPacket, recommendation: persisted.recommendation, ...(fallbackError ? { error: fallbackError } : {}) };
   // A recommendation is persisted as conversation state; only proposed memory
   // updates cross the Phase 5 review boundary.
   const hasMaterialProposal = output.proposed_belief_updates.length || output.proposed_records.length;

@@ -63,6 +63,9 @@ function topUnresolvedIssue(memory) {
 }
 
 function buildProjectContext(memory = {}) {
+  // Lazy to avoid the planner/context circular dependency at module load time.
+  const { planRecommendation } = require("./recommendation_planner");
+  const recommendationPlan = planRecommendation(memory);
   const project = memory.project || null;
   const assumptions = [...(memory.assumptions || [])].sort((a, b) => numeric(b.risk_score) - numeric(a.risk_score) || newestFirst(a, b)).slice(0, LIMITS.assumptions);
   const evidence = [...(memory.evidence || [])].sort(newestFirst).slice(0, LIMITS.evidence);
@@ -90,10 +93,12 @@ function buildProjectContext(memory = {}) {
     latest_decisions: decisions.map(record => compact(record, ["id", "title", "decision", "reason", "status", "decided_at", "created_at"])),
     latest_recommendation: recommendation ? compact(recommendation, ["id", "recommendation", "created_at"]) : null,
     recent_conversation_turns: turns.map(record => compact(record, ["id", "session_id", "turn_no", "actor_type", "content", "created_at"])),
-    top_unresolved_issue: topUnresolvedIssue(memory),
+    top_unresolved_issue: recommendationPlan.selected_issue,
+    ranked_unresolved_issues: recommendationPlan.ranked_issues,
+    deterministic_recommendation: recommendationPlan.recommendation,
     memory_record_ids: included_memory_record_ids
   };
   return { data, included_memory_record_ids };
 }
 
-module.exports = { LIMITS, buildProjectContext, buildContextPacket: buildProjectContext, topUnresolvedIssue, evidenceQuality, normalizedCategory };
+module.exports = { LIMITS, buildProjectContext, buildContextPacket: buildProjectContext, topUnresolvedIssue, issueFor, evidenceQuality, normalizedCategory, unresolvedStatuses, activeTaskStatuses, activeExperimentStatuses };

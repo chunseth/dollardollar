@@ -122,14 +122,14 @@ test("chat persists ordered turns, context linkage, and a current recommendation
     assert.equal(posted.assistant_turn.context_packet_id, posted.context_packet.id);
     assert.deepEqual(posted.context_packet.included_memory_record_ids.project, [project.id]);
     assert.deepEqual(posted.context_packet.data.memory_record_ids.project, [project.id]);
-    assert.deepEqual(posted.recommendation.recommendation.source_ids, [posted.context_packet.id, posted.founder_turn.id]);
+    assert.deepEqual(posted.recommendation.recommendation.source_ids, []);
     const linkage = (await pool.query("SELECT session.project_id AS session_project_id, packet.project_id AS context_project_id, founder.project_id AS founder_project_id, assistant.project_id AS assistant_project_id, recommendation.project_id AS recommendation_project_id FROM conversation_sessions session JOIN context_packets packet ON packet.id=$2 JOIN conversation_turns founder ON founder.id=$3 JOIN conversation_turns assistant ON assistant.id=$4 JOIN recommendations recommendation ON recommendation.id=$5 WHERE session.id=$1", [posted.founder_turn.session_id, posted.context_packet.id, posted.founder_turn.id, posted.assistant_turn.id, posted.recommendation.id])).rows[0];
     assert.deepEqual(Object.values(linkage), Array(5).fill(project.id));
     const history = await json(await api(`/api/projects/${project.id}/chat`));
     assert.deepEqual(history.turns.map(turn => turn.actor_type), ["founder", "ai"]);
     assert.deepEqual(history.turns.map(turn => turn.turn_no), [1, 2]);
     const recommendation = await json(await api(`/api/projects/${project.id}/recommendation`));
-    assert.equal(recommendation.recommendation.recommendation.state, "task");
+    assert.equal(recommendation.recommendation.recommendation.state, "wait");
     assert.equal(recommendation.recommendation.context_packet_id, posted.context_packet.id);
     const audit = await pool.query("SELECT actor_type, actor_id, event_type, entity_type, entity_id FROM event_log WHERE project_id=$1 AND entity_id = ANY($2::uuid[]) ORDER BY created_at", [project.id, [posted.founder_turn.id, posted.assistant_turn.id]]);
     assert.deepEqual(audit.rows.map(row => [row.actor_type, row.actor_id, row.event_type, row.entity_type]), [["founder", owner, "created", "conversation_turn"], ["ai", owner, "created", "conversation_turn"]]);
@@ -148,7 +148,8 @@ test("chat persists founder context before malformed, structural, contract-inval
     assert.equal(response.error.code, code);
     assert.ok(response.founder_turn.id);
     assert.ok(response.context_packet.id);
-    assert.equal(response.assistant_turn, null);
+    assert.ok(response.assistant_turn.id);
+    assert.ok(response.recommendation.id);
     const persisted = await pool.query("SELECT t.id AS turn_id, p.id AS packet_id FROM conversation_turns t JOIN context_packets p ON p.id=t.context_packet_id WHERE t.id=$1", [response.founder_turn.id]);
     assert.deepEqual(persisted.rows[0], { turn_id: response.founder_turn.id, packet_id: response.context_packet.id });
   }
@@ -175,11 +176,11 @@ test("material chat proposals are pending, provenance-controlled, idempotent, an
   await api(`/api/projects/${project.id}`, { method: "DELETE" });
 });
 
-test("four MVP chat flows run through the orchestrator route", async () => {
+test("chat model proposals cannot override the deterministic no-issue wait rule", async () => {
   const project = (await json(await api("/api/projects", { method: "POST", body: { name: "Flow coverage" } }))).project;
   for (const [message, state] of [["flow question", "question"], ["flow task", "task"], ["flow experiment", "experiment"], ["flow evidence", "wait"]]) {
     const posted = await json(await api(`/api/projects/${project.id}/chat`, { method: "POST", body: { message, client_request_id: `${message}-retry-key` } }));
-    assert.equal(posted.recommendation.recommendation.state, state);
+    assert.equal(posted.recommendation.recommendation.state, "wait");
     assert.ok(posted.assistant_turn.id);
     if (message === "flow question") assert.equal(posted.change_set.items[0].record_type, "belief");
     if (message === "flow task") assert.equal(posted.change_set.items[0].record_type, "task");
@@ -207,6 +208,26 @@ test("recommendation has an explicit empty state", async () => {
     const project = (await json(await api("/api/projects", { method: "POST", body: { name: "No recommendation" } }))).project;
     assert.deepEqual(await json(await api(`/api/projects/${project.id}/recommendation`)), { recommendation: null });
     await api(`/api/projects/${project.id}`, { method: "DELETE" });
+});
+
+test("state changes recalculate atomically and preserve readable recommendation history", async () => {
+  const project = (await json(await api("/api/projects", { method: "POST", body: { name: "Recommendation triggers" } }))).project;
+  const assumption = (await json(await api(`/api/projects/${project.id}/assumptions`, { method: "POST", body: { statement: "Operators will pay", category: "willingness_to_pay", importance: 3, uncertainty: 2, risk_score: 40 } }))).assumption;
+  assert.equal((await json(await api(`/api/projects/${project.id}/recommendation`))).recommendation.state, "question");
+  await json(await api(`/api/projects/${project.id}/evidence`, { method: "POST", body: { source_type: "interview", source_title: "Interview", summary: "One operator described the problem" } }));
+  const experiment = (await json(await api(`/api/projects/${project.id}/experiments`, { method: "POST", body: { assumption_id: assumption.id, title: "Paid offer", hypothesis: "Operators will pay", success_metric: "One deposit" } }))).experiment;
+  assert.equal((await json(await api(`/api/projects/${project.id}/recommendation`))).recommendation.state, "wait");
+  await json(await api(`/api/projects/${project.id}/experiments/${experiment.id}`, { method: "PATCH", body: { status: "completed" } }));
+  const task = (await json(await api(`/api/projects/${project.id}/tasks`, { method: "POST", body: { assumption_id: assumption.id, title: "Ask one operator" } }))).task;
+  await json(await api(`/api/projects/${project.id}/tasks/${task.id}`, { method: "PATCH", body: { status: "doing" } }));
+  assert.equal((await json(await api(`/api/projects/${project.id}/recommendation`))).recommendation.state, "wait");
+  await json(await api(`/api/projects/${project.id}/tasks/${task.id}`, { method: "PATCH", body: { status: "done" } }));
+  const history = await json(await api(`/api/projects/${project.id}/recommendation/history`));
+  assert.ok(history.recommendations.length >= 7);
+  assert.equal(history.recommendations.filter(item => item.status === "active").length, 1);
+  assert.ok(history.recommendations[0].source_context.packet);
+  assert.ok(history.recommendations.some(item => item.supersedes_id));
+  await api(`/api/projects/${project.id}`, { method: "DELETE" });
 });
 
 test("nested chat and recommendation paths are not matched", async () => {
