@@ -5,6 +5,7 @@ const path = require("path");
 const { query, transaction } = require("./db");
 const { createDraft, createPlan, normalizeDraft, fields: onboardingFields, industries, industryModules, revenuePathFields, projectTitle } = require("./onboarding");
 const { buildProjectContext } = require("./context");
+const { handleFounderMessage } = require("./cofounder");
 const { createBeliefFromAssumption, appendBeliefVersion, linkEvidenceToBeliefVersion } = require("./beliefs");
 const { proposeChangeSet, approveChangeSet, approveChangeSetItems, rejectChangeSet, editChangeSetItem, getPendingChangeSetsForProject, applyApprovedChangeSet } = require("./change_sets");
 
@@ -172,22 +173,7 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
     const body = await readBody(request);
     if (typeof body.message !== "string" || !body.message.trim()) return fail(response, 422, "Chat message is required");
     if (body.message.length > 20_000) return fail(response, 422, "Chat message must be 20,000 characters or fewer");
-    const result = await transaction(async client => {
-      let session = (await client.query("SELECT id FROM conversation_sessions WHERE project_id=$1 AND status='open' ORDER BY created_at DESC LIMIT 1 FOR UPDATE", [projectId])).rows[0];
-      if (!session) session = (await client.query("INSERT INTO conversation_sessions (project_id, initiated_by) VALUES ($1,'founder') RETURNING id", [projectId])).rows[0];
-      const memory = await fullMemory(projectId, client, true);
-      const packet = buildProjectContext(memory);
-      const contextPacket = (await client.query("INSERT INTO context_packets (project_id,purpose,data,included_memory_record_ids) VALUES ($1,'chat_turn',$2,$3) RETURNING *", [projectId, packet.data, packet.included_memory_record_ids])).rows[0];
-      const nextTurn = (await client.query("SELECT COALESCE(MAX(turn_no),0)+1 AS turn_no FROM conversation_turns WHERE session_id=$1", [session.id])).rows[0].turn_no;
-      const founderTurn = (await client.query("INSERT INTO conversation_turns (session_id,project_id,context_packet_id,turn_no,actor_type,content) VALUES ($1,$2,$3,$4,'founder',$5) RETURNING *", [session.id, projectId, contextPacket.id, nextTurn, body.message.trim()])).rows[0];
-      const payload = validateAssistantPayload(await generateAssistant({ project: existingProject, message: founderTurn.content, contextPacket, founderTurn }));
-      const assistantTurn = (await client.query("INSERT INTO conversation_turns (session_id,project_id,context_packet_id,turn_no,actor_type,content,model,prompt_version,structured_payload) VALUES ($1,$2,$3,$4,'ai',$5,$6,$7,$8) RETURNING *", [session.id, projectId, contextPacket.id, Number(nextTurn) + 1, payload.assistant_message, payload.model, payload.prompt_version, payload.structured_payload])).rows[0];
-      await client.query("UPDATE recommendations SET status='superseded' WHERE project_id=$1 AND status='active'", [projectId]);
-      const recommendation = (await client.query("INSERT INTO recommendations (project_id,context_packet_id,recommendation) VALUES ($1,$2,$3) RETURNING id, context_packet_id, recommendation, created_at", [projectId, contextPacket.id, payload.recommendation])).rows[0];
-      await log(client, projectId, "founder", "created", "conversation_turn", founderTurn.id, "Created founder chat turn", { context_packet_id: contextPacket.id });
-      await log(client, projectId, "ai", "generated", "conversation_turn", assistantTurn.id, "Generated assistant chat turn", { context_packet_id: contextPacket.id, model: payload.model, prompt_version: payload.prompt_version });
-      return { founder_turn: founderTurn, assistant_turn: assistantTurn, context_packet: contextPacket, recommendation };
-    });
+    const result = await handleFounderMessage(projectId, owner, body.message, { callCofounderModel: generateAssistant });
     return send(response, 201, result);
   }
   if (parts[3] === "memory" && method === "GET") return send(response, 200, await fullMemory(projectId));
