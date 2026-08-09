@@ -22,6 +22,7 @@ const { createServer } = require("../server");
 const { pool } = require("../db");
 const owner = `chat-founder-${Date.now()}`;
 let server, baseUrl;
+let modelSawPersistedFounderTurn = false;
 const api = (path, options = {}) => fetch(`${baseUrl}${path}`, { ...options, headers: { "Content-Type": "application/json", "x-user-id": owner, ...(options.headers || {}) }, body: options.body && typeof options.body !== "string" ? JSON.stringify(options.body) : options.body });
 const json = async response => { const body = await response.json(); assert.equal(response.ok, true, JSON.stringify(body)); return body; };
 
@@ -68,11 +69,46 @@ test.before(async () => {
     CREATE UNIQUE INDEX IF NOT EXISTS recommendations_one_active_per_project_idx ON recommendations(project_id) WHERE status = 'active';
   `);
   server = createServer({
-    generateAssistant: async ({ contextPacket, founderTurn }) => ({
+    generateAssistant: async ({ contextPacket, founderTurn, message }) => {
+      if (message === "return invalid") return null;
+      if (message === "return structurally invalid") return [];
+      if (message === "return contract invalid") return { assistant_message: "Missing required contract fields" };
+      if (message === "inspect persistence") {
+        const persisted = await pool.query("SELECT t.id FROM conversation_turns t JOIN context_packets p ON p.id=t.context_packet_id WHERE t.id=$1 AND p.id=$2", [founderTurn.id, contextPacket.id]);
+        modelSawPersistedFounderTurn = persisted.rowCount === 1;
+        return null;
+      }
+      if (message === "model outage") throw new Error("test model outage");
+      const flowState = { "flow question": "question", "flow task": "task", "flow experiment": "experiment", "flow evidence": "wait" }[message];
+      if (flowState) {
+        const records = {
+          "flow task": [{ type: "task", payload: { title: "Record completed outreach", justification: "Captures the reported task result." }, source_ids: [contextPacket.id, founderTurn.id] }],
+          "flow experiment": [{ type: "experiment", payload: { title: "Record experiment result", hypothesis: "The paid pilot ask works", success_metric: "Three deposits", justification: "Captures the reported experiment result." }, source_ids: [contextPacket.id, founderTurn.id] }],
+          "flow evidence": [{ type: "evidence", payload: { source_type: "founder_report", source_title: "Founder result", summary: "Three prospects described the same problem." }, source_ids: [contextPacket.id, founderTurn.id] }]
+        }[message] || [];
+        return {
+          assistant_message: `Handled ${message}.`, model: "test-assistant", prompt_version: "test-v1",
+          proposed_belief_updates: message === "flow question" ? [{ statement: "The founder clarified the current blocker.", classification: "founder_statement", source_ids: [contextPacket.id, founderTurn.id] }] : [],
+          proposed_records: records,
+          recommendation: { state: flowState, primary_issue: "Payment evidence is incomplete", reason: "The update maps to one focused next state.", action_payload: {}, confidence: 0.6, source_ids: [contextPacket.id, founderTurn.id] },
+          needs_founder_review: true
+        };
+      }
+      if (message === "make material proposal" || message === "reject material proposal") return {
+        assistant_message: message === "reject material proposal" ? "Proposal validation failure" : "Create a founder outreach task.", model: "test-assistant", prompt_version: "test-v1",
+        proposed_belief_updates: [], proposed_records: [{ type: "task", payload: { title: "Ask five founders", justification: "Tests the current uncertainty." }, source_ids: [contextPacket.id, founderTurn.id] }],
+        recommendation: { state: "task", primary_issue: "No payment evidence", reason: "A paid ask tests willingness to pay.", action_payload: { title: "Ask five founders" }, confidence: 0.6, source_ids: [contextPacket.id, founderTurn.id] }, needs_founder_review: true
+      };
+      return {
       assistant_message: "Ask five founders for a paid pilot.", model: "test-assistant", prompt_version: "test-v1",
       structured_payload: { proposal: "paid-pilot" }, recommendation: { state: "task", primary_issue: "No payment evidence", reason: "A paid ask tests willingness to pay.", action_payload: { title: "Ask five founders" }, confidence: 0.6, source_ids: [contextPacket.id, founderTurn.id] },
       included_memory_record_ids: contextPacket.included_memory_record_ids
-    })
+      };
+    },
+    proposeChangeSet: async (projectId, output, options) => {
+      if (output.assistant_message === "Proposal validation failure") throw Object.assign(new Error("forced proposal validation failure"), { code: "INVALID_CHANGE_SET" });
+      return require("../change_sets").proposeChangeSet(projectId, output, options);
+    }
   });
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   baseUrl = `http://127.0.0.1:${server.address().port}`;
@@ -95,8 +131,76 @@ test("chat persists ordered turns, context linkage, and a current recommendation
     const recommendation = await json(await api(`/api/projects/${project.id}/recommendation`));
     assert.equal(recommendation.recommendation.recommendation.state, "task");
     assert.equal(recommendation.recommendation.context_packet_id, posted.context_packet.id);
+    const audit = await pool.query("SELECT actor_type, actor_id, event_type, entity_type, entity_id FROM event_log WHERE project_id=$1 AND entity_id = ANY($2::uuid[]) ORDER BY created_at", [project.id, [posted.founder_turn.id, posted.assistant_turn.id]]);
+    assert.deepEqual(audit.rows.map(row => [row.actor_type, row.actor_id, row.event_type, row.entity_type]), [["founder", owner, "created", "conversation_turn"], ["ai", owner, "created", "conversation_turn"]]);
     assert.equal((await api(`/api/projects/${project.id}/chat`, { headers: { "x-user-id": "someone-else" } })).status, 404);
     assert.equal((await api(`/api/projects/${project.id}`, { method: "DELETE" })).status, 204);
+});
+
+test("chat persists founder context before malformed, structural, contract-invalid output, or model failure", async () => {
+  const project = (await json(await api("/api/projects", { method: "POST", body: { name: "Chat failures" } }))).project;
+  modelSawPersistedFounderTurn = false;
+  const observed = await json(await api(`/api/projects/${project.id}/chat`, { method: "POST", body: { message: "inspect persistence" } }));
+  assert.equal(observed.error.code, "invalid_model_output");
+  assert.equal(modelSawPersistedFounderTurn, true);
+  for (const [message, code] of [["return invalid", "invalid_model_output"], ["return structurally invalid", "invalid_model_output"], ["return contract invalid", "invalid_model_output"], ["model outage", "model_failure"]]) {
+    const response = await json(await api(`/api/projects/${project.id}/chat`, { method: "POST", body: { message } }));
+    assert.equal(response.error.code, code);
+    assert.ok(response.founder_turn.id);
+    assert.ok(response.context_packet.id);
+    assert.equal(response.assistant_turn, null);
+    const persisted = await pool.query("SELECT t.id AS turn_id, p.id AS packet_id FROM conversation_turns t JOIN context_packets p ON p.id=t.context_packet_id WHERE t.id=$1", [response.founder_turn.id]);
+    assert.deepEqual(persisted.rows[0], { turn_id: response.founder_turn.id, packet_id: response.context_packet.id });
+  }
+  await api(`/api/projects/${project.id}`, { method: "DELETE" });
+});
+
+test("material chat proposals are pending, provenance-controlled, idempotent, and never directly mutate memory", async () => {
+  const project = (await json(await api("/api/projects", { method: "POST", body: { name: "Material chat" } }))).project;
+  const body = { message: "make material proposal", client_request_id: "material-retry-1" };
+  const posted = await json(await api(`/api/projects/${project.id}/chat`, { method: "POST", body }));
+  assert.equal(posted.change_set.status, "pending_review");
+  assert.equal(posted.change_set.source_turn_id, posted.assistant_turn.id);
+  assert.equal(posted.change_set.items.length, 1);
+  assert.equal(posted.change_set.items[0].record_type, "task");
+  assert.equal(posted.change_set.proposal_metadata.provenance.founder_turn_id, posted.founder_turn.id);
+  assert.equal(posted.change_set.proposal_metadata.provenance.assistant_turn_id, posted.assistant_turn.id);
+  assert.equal((await pool.query("SELECT count(*)::int AS count FROM tasks WHERE project_id=$1", [project.id])).rows[0].count, 0);
+  assert.equal((await pool.query("SELECT count(*)::int AS count FROM beliefs WHERE project_id=$1", [project.id])).rows[0].count, 0);
+  assert.equal((await pool.query("SELECT count(*)::int AS count FROM recommendations WHERE project_id=$1", [project.id])).rows[0].count, 1);
+  const replay = await json(await api(`/api/projects/${project.id}/chat`, { method: "POST", body }));
+  assert.equal(replay.change_set.reused, true);
+  assert.equal(replay.change_set.id, posted.change_set.id);
+  assert.equal((await pool.query("SELECT count(*)::int AS count FROM change_sets WHERE project_id=$1", [project.id])).rows[0].count, 1);
+  await api(`/api/projects/${project.id}`, { method: "DELETE" });
+});
+
+test("four MVP chat flows run through the orchestrator route", async () => {
+  const project = (await json(await api("/api/projects", { method: "POST", body: { name: "Flow coverage" } }))).project;
+  for (const [message, state] of [["flow question", "question"], ["flow task", "task"], ["flow experiment", "experiment"], ["flow evidence", "wait"]]) {
+    const posted = await json(await api(`/api/projects/${project.id}/chat`, { method: "POST", body: { message, client_request_id: `${message}-retry-key` } }));
+    assert.equal(posted.recommendation.recommendation.state, state);
+    assert.ok(posted.assistant_turn.id);
+    if (message === "flow question") assert.equal(posted.change_set.items[0].record_type, "belief");
+    if (message === "flow task") assert.equal(posted.change_set.items[0].record_type, "task");
+    if (message === "flow experiment") assert.equal(posted.change_set.items[0].record_type, "experiment");
+    if (message === "flow evidence") assert.equal(posted.change_set.items[0].record_type, "evidence");
+  }
+  await api(`/api/projects/${project.id}`, { method: "DELETE" });
+});
+
+test("chat reports change-set validation failures after saving a valid assistant turn and supersedes recommendations", async () => {
+  const project = (await json(await api("/api/projects", { method: "POST", body: { name: "Proposal failure" } }))).project;
+  await json(await api(`/api/projects/${project.id}/chat`, { method: "POST", body: { message: "first turn" } }));
+  const second = await json(await api(`/api/projects/${project.id}/chat`, { method: "POST", body: { message: "second turn" } }));
+  assert.equal((await pool.query("SELECT count(*)::int AS count FROM recommendations WHERE project_id=$1 AND status='active'", [project.id])).rows[0].count, 1);
+  assert.equal((await pool.query("SELECT count(*)::int AS count FROM recommendations WHERE project_id=$1 AND status='superseded'", [project.id])).rows[0].count, 1);
+  assert.ok(second.recommendation.id);
+  const failure = await json(await api(`/api/projects/${project.id}/chat`, { method: "POST", body: { message: "reject material proposal" } }));
+  assert.ok(failure.assistant_turn.id);
+  assert.equal(failure.proposal_error.code, "INVALID_CHANGE_SET");
+  assert.equal((await pool.query("SELECT count(*)::int AS count FROM change_sets WHERE project_id=$1", [project.id])).rows[0].count, 0);
+  await api(`/api/projects/${project.id}`, { method: "DELETE" });
 });
 
 test("recommendation has an explicit empty state", async () => {

@@ -32,7 +32,9 @@ test("local default model is valid and never needs a live dependency", async () 
   assert.equal(normalizeCofounderOutput(output, contextPacket, founderTurn).recommendation.state, "question");
 });
 
-test("proposal idempotency is deterministic for a persisted assistant turn and context", () => {
-  assert.equal(idempotencyKey("project-1", { id: "assistant-1" }, contextPacket), idempotencyKey("project-1", { id: "assistant-1" }, contextPacket));
-  assert.notEqual(idempotencyKey("project-1", { id: "assistant-2" }, contextPacket), idempotencyKey("project-1", { id: "assistant-1" }, contextPacket));
+test("proposal idempotency is deterministic for the same proposal retry, not a newly-created assistant turn", () => {
+  const proposal = output("task", [{ type: "task", payload: { title: "Ask five founders" }, source_ids: ["turn-1"] }]);
+  assert.equal(idempotencyKey("project-1", proposal, contextPacket, founderTurn), idempotencyKey("project-1", proposal, contextPacket, founderTurn));
+  assert.equal(idempotencyKey("project-1", proposal, { id: "context-2" }, { id: "turn-2" }, "retry-1"), idempotencyKey("project-1", proposal, contextPacket, founderTurn, "retry-1"));
+  assert.notEqual(idempotencyKey("project-1", { ...proposal, assistant_message: "Different proposal" }, contextPacket, founderTurn), idempotencyKey("project-1", proposal, contextPacket, founderTurn));
 });

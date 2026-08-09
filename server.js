@@ -7,7 +7,7 @@ const { createDraft, createPlan, normalizeDraft, fields: onboardingFields, indus
 const { buildProjectContext } = require("./context");
 const { handleFounderMessage } = require("./cofounder");
 const { createBeliefFromAssumption, appendBeliefVersion, linkEvidenceToBeliefVersion } = require("./beliefs");
-const { proposeChangeSet, approveChangeSet, approveChangeSetItems, rejectChangeSet, editChangeSetItem, getPendingChangeSetsForProject, applyApprovedChangeSet } = require("./change_sets");
+const { proposeChangeSet: defaultProposeChangeSet, approveChangeSet, approveChangeSetItems, rejectChangeSet, editChangeSetItem, getPendingChangeSetsForProject, applyApprovedChangeSet } = require("./change_sets");
 
 const root = __dirname;
 const types = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8" };
@@ -103,7 +103,7 @@ async function chatHistory(projectId) {
   return (await query("SELECT id, session_id, context_packet_id, turn_no, actor_type, content, model, prompt_version, structured_payload, created_at FROM conversation_turns WHERE project_id=$1 ORDER BY created_at ASC, turn_no ASC", [projectId])).rows;
 }
 
-async function api(request, response, url, generatePlan = createPlan, generateAssistant = placeholderAssistant) {
+async function api(request, response, url, generatePlan = createPlan, generateAssistant = placeholderAssistant, proposeCofounderChangeSet = defaultProposeChangeSet) {
   const parts = url.pathname.split("/").filter(Boolean); const method = request.method; const owner = userId(request);
   if (url.pathname === "/api/onboarding/draft" && method === "POST") { if (!allowDraft(request)) return fail(response, 429, "Too many onboarding drafts. Please wait a minute and try again."); const draft = await createDraft(await readBody(request)); return send(response, 200, { draft, requires_follow_up: draft.requires_follow_up === true }); }
   if (url.pathname === "/api/onboarding/confirm" && method === "POST") {
@@ -144,7 +144,7 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
     if (parts.length === 4 && method === "GET") return send(response, 200, { change_sets: await getPendingChangeSetsForProject(projectId, context) });
     if (parts.length === 4 && method === "POST") {
       const body = await readBody(request);
-      return send(response, 201, { change_set: await proposeChangeSet(projectId, body) });
+      return send(response, 201, { change_set: await defaultProposeChangeSet(projectId, body) });
     }
     const changeSetId = parts[4];
     if (!changeSetId) return fail(response, 404, "Change set not found");
@@ -173,7 +173,7 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
     const body = await readBody(request);
     if (typeof body.message !== "string" || !body.message.trim()) return fail(response, 422, "Chat message is required");
     if (body.message.length > 20_000) return fail(response, 422, "Chat message must be 20,000 characters or fewer");
-    const result = await handleFounderMessage(projectId, owner, body.message, { callCofounderModel: generateAssistant });
+    const result = await handleFounderMessage(projectId, owner, body.message, { callCofounderModel: generateAssistant, proposeChangeSet: proposeCofounderChangeSet, client_request_id: body.client_request_id || body.clientRequestId });
     return send(response, 201, result);
   }
   if (parts[3] === "memory" && method === "GET") return send(response, 200, await fullMemory(projectId));
@@ -209,11 +209,11 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
   return false;
 }
 
-function createServer({ generatePlan = createPlan, generateAssistant = placeholderAssistant } = {}) {
+function createServer({ generatePlan = createPlan, generateAssistant = placeholderAssistant, proposeChangeSet = defaultProposeChangeSet } = {}) {
 const server = http.createServer(async (request, response) => {
   try {
     const url = new URL(request.url, `http://${request.headers.host}`);
-    if (url.pathname.startsWith("/api/")) { const handled = await api(request, response, url, generatePlan, generateAssistant); if (!handled) fail(response, 404, "API route not found"); return; }
+    if (url.pathname.startsWith("/api/")) { const handled = await api(request, response, url, generatePlan, generateAssistant, proposeChangeSet); if (!handled) fail(response, 404, "API route not found"); return; }
     if (request.method !== "GET" && request.method !== "HEAD") return fail(response, 405, "Method not allowed");
     const requestedPath = url.pathname === "/" ? "/index.html" : url.pathname; const filePath = path.normalize(path.join(root, requestedPath));
     if (!filePath.startsWith(root + path.sep)) return fail(response, 403, "Forbidden");

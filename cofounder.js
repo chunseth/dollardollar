@@ -32,17 +32,15 @@ async function callCofounderModel({ contextPacket, founderTurn }) {
 
 async function fullMemory(projectId, executor) {
   const run = executor.query.bind(executor);
-  const [project, assumptions, evidence, experiments, tasks, decisions, links, recommendation, turns] = await Promise.all([
-    run("SELECT * FROM projects WHERE id=$1", [projectId]),
-    run("SELECT * FROM assumptions WHERE project_id=$1 ORDER BY risk_score DESC, created_at", [projectId]),
-    run("SELECT * FROM evidence WHERE project_id=$1 ORDER BY created_at DESC", [projectId]),
-    run("SELECT * FROM experiments WHERE project_id=$1 ORDER BY created_at DESC", [projectId]),
-    run("SELECT * FROM tasks WHERE project_id=$1 ORDER BY created_at", [projectId]),
-    run("SELECT * FROM decisions WHERE project_id=$1 ORDER BY created_at DESC", [projectId]),
-    run("SELECT ae.* FROM assumption_evidence ae JOIN evidence e ON e.id=ae.evidence_id WHERE e.project_id=$1", [projectId]),
-    run("SELECT id, context_packet_id, recommendation, created_at FROM recommendations WHERE project_id=$1 AND status='active' ORDER BY created_at DESC, id DESC LIMIT 1", [projectId]),
-    run("SELECT id, session_id, turn_no, actor_type, content, created_at FROM conversation_turns WHERE project_id=$1 ORDER BY created_at DESC, turn_no DESC, id DESC LIMIT 20", [projectId])
-  ]);
+  const project = await run("SELECT * FROM projects WHERE id=$1", [projectId]);
+  const assumptions = await run("SELECT * FROM assumptions WHERE project_id=$1 ORDER BY risk_score DESC, created_at", [projectId]);
+  const evidence = await run("SELECT * FROM evidence WHERE project_id=$1 ORDER BY created_at DESC", [projectId]);
+  const experiments = await run("SELECT * FROM experiments WHERE project_id=$1 ORDER BY created_at DESC", [projectId]);
+  const tasks = await run("SELECT * FROM tasks WHERE project_id=$1 ORDER BY created_at", [projectId]);
+  const decisions = await run("SELECT * FROM decisions WHERE project_id=$1 ORDER BY created_at DESC", [projectId]);
+  const links = await run("SELECT ae.* FROM assumption_evidence ae JOIN evidence e ON e.id=ae.evidence_id WHERE e.project_id=$1", [projectId]);
+  const recommendation = await run("SELECT id, context_packet_id, recommendation, created_at FROM recommendations WHERE project_id=$1 AND status='active' ORDER BY created_at DESC, id DESC LIMIT 1", [projectId]);
+  const turns = await run("SELECT id, session_id, turn_no, actor_type, content, created_at FROM conversation_turns WHERE project_id=$1 ORDER BY created_at DESC, turn_no DESC, id DESC LIMIT 20", [projectId]);
   return { project: project.rows[0], assumptions: assumptions.rows, evidence: evidence.rows, experiments: experiments.rows, tasks: tasks.rows, decisions: decisions.rows, assumption_evidence: links.rows, latest_recommendation: recommendation.rows[0] || null, conversation_turns: turns.rows };
 }
 
@@ -85,7 +83,7 @@ function normalizeCofounderOutput(raw, contextPacket, founderTurn) {
   return normalized;
 }
 
-async function persistConversationTurn(projectId, message) {
+async function persistConversationTurn(projectId, message, userId = null) {
   return transaction(async client => {
     let session = (await client.query("SELECT id FROM conversation_sessions WHERE project_id=$1 AND status='open' ORDER BY created_at DESC LIMIT 1 FOR UPDATE", [projectId])).rows[0];
     if (!session) session = (await client.query("INSERT INTO conversation_sessions (project_id,initiated_by) VALUES ($1,'founder') RETURNING id", [projectId])).rows[0];
@@ -93,17 +91,38 @@ async function persistConversationTurn(projectId, message) {
     const contextPacket = (await client.query("INSERT INTO context_packets (project_id,purpose,data,included_memory_record_ids) VALUES ($1,'chat_turn',$2,$3) RETURNING *", [projectId, packet.data, packet.included_memory_record_ids])).rows[0];
     const turnNo = (await client.query("SELECT COALESCE(MAX(turn_no),0)+1 AS turn_no FROM conversation_turns WHERE session_id=$1", [session.id])).rows[0].turn_no;
     const founderTurn = (await client.query("INSERT INTO conversation_turns (session_id,project_id,context_packet_id,turn_no,actor_type,content) VALUES ($1,$2,$3,$4,'founder',$5) RETURNING *", [session.id, projectId, contextPacket.id, turnNo, message])).rows[0];
+    await client.query("INSERT INTO event_log (project_id,actor_type,actor_id,event_type,entity_type,entity_id,summary,payload) VALUES ($1,'founder',$2,'created','conversation_turn',$3,$4,$5)", [projectId, userId, founderTurn.id, "Saved founder chat turn", { context_packet_id: contextPacket.id, turn_no: founderTurn.turn_no }]);
     return { contextPacket, founderTurn, sessionId: session.id, nextTurn: Number(turnNo) + 1 };
   });
 }
 
-function idempotencyKey(projectId, assistantTurn, contextPacket) {
-  return `phase6:${crypto.createHash("sha256").update(`${projectId}:${assistantTurn.id}:${contextPacket.id}`).digest("hex")}`;
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+  return JSON.stringify(value);
 }
 
-async function persistAssistantResponse(projectId, saved, output) {
+function proposalIdentity(output) {
+  const stripVolatileProvenance = value => {
+    if (Array.isArray(value)) return value.map(stripVolatileProvenance);
+    if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "source_ids").map(([key, item]) => [key, stripVolatileProvenance(item)]));
+    return value;
+  };
+  return stripVolatileProvenance(output);
+}
+
+function idempotencyKey(projectId, output, contextPacket, founderTurn, retryKey = null) {
+  // The model proposal, not a newly-created assistant turn, is the stable
+  // retry identity. A client-supplied retry key preserves idempotency across
+  // repeated HTTP attempts that necessarily create fresh persisted chat turns.
+  const identity = retryKey ? { projectId, retry_key: retryKey, output: proposalIdentity(output) } : { projectId, context_packet_id: contextPacket.id, founder_turn_id: founderTurn.id, output };
+  return `phase6:${crypto.createHash("sha256").update(stableJson(identity)).digest("hex")}`;
+}
+
+async function persistAssistantResponse(projectId, saved, output, userId) {
   return transaction(async client => {
     const assistantTurn = (await client.query("INSERT INTO conversation_turns (session_id,project_id,context_packet_id,turn_no,actor_type,content,model,prompt_version,structured_payload) VALUES ($1,$2,$3,$4,'ai',$5,$6,$7,$8) RETURNING *", [saved.sessionId, projectId, saved.contextPacket.id, saved.nextTurn, output.assistant_message, output.model, output.prompt_version, output])).rows[0];
+    await client.query("INSERT INTO event_log (project_id,actor_type,actor_id,event_type,entity_type,entity_id,summary,payload) VALUES ($1,'ai',$2,'created','conversation_turn',$3,$4,$5)", [projectId, userId, assistantTurn.id, "Saved AI chat turn", { context_packet_id: saved.contextPacket.id, turn_no: assistantTurn.turn_no, model: output.model, prompt_version: output.prompt_version }]);
     await client.query("UPDATE recommendations SET status='superseded' WHERE project_id=$1 AND status='active'", [projectId]);
     const recommendation = (await client.query("INSERT INTO recommendations (project_id,context_packet_id,recommendation) VALUES ($1,$2,$3) RETURNING id, context_packet_id, recommendation, created_at", [projectId, saved.contextPacket.id, output.recommendation])).rows[0];
     return { assistantTurn, recommendation };
@@ -112,23 +131,30 @@ async function persistAssistantResponse(projectId, saved, output) {
 
 async function handleFounderMessage(projectId, userId, message, options = {}) {
   if (typeof message !== "string" || !message.trim()) throw Object.assign(new Error("Chat message is required"), { status: 422 });
-  const saved = await persistConversationTurn(projectId, message.trim());
+  const saved = await persistConversationTurn(projectId, message.trim(), userId);
+  let raw;
+  try {
+    raw = await (options.callCofounderModel || callCofounderModel)({ projectId, userId, message: saved.founderTurn.content, contextPacket: saved.contextPacket, founderTurn: saved.founderTurn });
+  } catch (error) {
+    return { founder_turn: saved.founderTurn, assistant_turn: null, context_packet: saved.contextPacket, recommendation: null, error: modelError("model_failure", error) };
+  }
   let output;
   try {
-    output = normalizeCofounderOutput(await (options.callCofounderModel || callCofounderModel)({ projectId, userId, message: saved.founderTurn.content, contextPacket: saved.contextPacket, founderTurn: saved.founderTurn }), saved.contextPacket, saved.founderTurn);
+    output = normalizeCofounderOutput(raw, saved.contextPacket, saved.founderTurn);
   } catch (error) {
-    return { founder_turn: saved.founderTurn, assistant_turn: null, context_packet: saved.contextPacket, recommendation: null, error: modelError(error.code === "INVALID_COFUNDER_CONTRACT" ? "invalid_model_output" : "model_failure", error) };
+    return { founder_turn: saved.founderTurn, assistant_turn: null, context_packet: saved.contextPacket, recommendation: null, error: modelError("invalid_model_output", error) };
   }
-  const persisted = await persistAssistantResponse(projectId, saved, output);
+  const persisted = await persistAssistantResponse(projectId, saved, output, userId);
   const result = { founder_turn: saved.founderTurn, assistant_turn: persisted.assistantTurn, context_packet: saved.contextPacket, recommendation: persisted.recommendation };
   // A recommendation is persisted as conversation state; only proposed memory
   // updates cross the Phase 5 review boundary.
   const hasMaterialProposal = output.proposed_belief_updates.length || output.proposed_records.length;
   if (!hasMaterialProposal) return result;
   try {
-    result.change_set = await proposeChangeSet(projectId, output, {
+    result.change_set = await (options.proposeChangeSet || proposeChangeSet)(projectId, output, {
       source_turn_id: persisted.assistantTurn.id,
-      idempotency_key: idempotencyKey(projectId, persisted.assistantTurn, saved.contextPacket),
+      idempotency_key: idempotencyKey(projectId, output, saved.contextPacket, saved.founderTurn, options.idempotencyKey || options.idempotency_key || options.clientRequestId || options.client_request_id),
+      include_recommendation: false,
       proposal_metadata: { phase: 6, source_turn_id: persisted.assistantTurn.id, context_packet_id: saved.contextPacket.id, provenance: { founder_turn_id: saved.founderTurn.id, assistant_turn_id: persisted.assistantTurn.id } }
     });
   } catch (error) {

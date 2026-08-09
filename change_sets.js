@@ -33,7 +33,7 @@ function normalizePayload(payload) {
   jsonBounds(payload); if (payloadBytes(payload) > MAX_PAYLOAD_BYTES) throw fail("Change-set payload is too large");
   return payload;
 }
-function normalizedItems(aiPayload) {
+function normalizedItems(aiPayload, includeRecommendation = true) {
   if (!object(aiPayload)) throw fail("AI proposal must be an object");
   const items = Array.isArray(aiPayload.items) ? [...aiPayload.items] : (() => {
     const beliefs = aiPayload.proposed_belief_updates || [];
@@ -41,7 +41,7 @@ function normalizedItems(aiPayload) {
     if (!Array.isArray(beliefs) || !Array.isArray(records)) throw fail("AI proposal items must be arrays");
     return [...beliefs.map(payload => ({ record_type: "belief", operation: payload.target_entity_id ? "update" : "create", target_entity_id: payload.target_entity_id, payload })), ...records.map(record => ({ record_type: record.type, operation: record.operation || "create", target_entity_id: record.target_entity_id, payload: { ...record.payload, source_ids: record.source_ids } }))];
   })();
-  if (aiPayload.recommendation !== undefined) items.push({ record_type: "recommendation", operation: "create", payload: aiPayload.recommendation });
+  if (includeRecommendation && aiPayload.recommendation !== undefined) items.push({ record_type: "recommendation", operation: "create", payload: aiPayload.recommendation });
   return items;
 }
 async function projectRecord(client, projectId) { const result = await client.query("SELECT id FROM projects WHERE id=$1", [projectId]); if (!result.rowCount) throw fail("Project not found"); }
@@ -115,7 +115,7 @@ async function proposeChangeSet(projectId, aiPayload, options = {}) {
     } else {
       try { validateCofounderOutput(aiPayload); } catch (error) { throw fail(`Invalid cofounder output: ${error.message}`); }
     }
-    const rawItems = normalizedItems(aiPayload); if (!rawItems.length || rawItems.length > MAX_ITEMS) throw fail("Change set must contain a bounded number of items");
+    const rawItems = normalizedItems(aiPayload, options.include_recommendation !== false); if (!rawItems.length || rawItems.length > MAX_ITEMS) throw fail("Change set must contain a bounded number of items");
     const top = await currentTopIssue(client, projectId), items = [];
     for (const item of rawItems) items.push(await validateItem(client, projectId, item, top));
     const idempotencyKey = options.idempotency_key || aiPayload.idempotency_key;
