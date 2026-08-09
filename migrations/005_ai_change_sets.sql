@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS change_set_items (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   change_set_id uuid NOT NULL REFERENCES change_sets(id) ON DELETE CASCADE,
   sequence_number integer NOT NULL CHECK (sequence_number > 0),
-  record_type text NOT NULL CHECK (record_type IN ('belief','evidence','task','experiment','decision')),
+  record_type text NOT NULL CHECK (record_type IN ('belief','evidence','task','experiment','decision','recommendation')),
   operation text NOT NULL CHECK (operation IN ('create','update','link')),
   target_entity_id uuid,
   original_payload jsonb NOT NULL CHECK (jsonb_typeof(original_payload) = 'object'),
@@ -52,6 +52,11 @@ CREATE TABLE IF NOT EXISTS change_set_items (
     (operation IN ('update','link') AND target_entity_id IS NOT NULL)
   )
 );
+
+-- Keep already-created databases aligned when the recommendation item is added
+-- after the initial Phase 5 deployment.
+ALTER TABLE change_set_items DROP CONSTRAINT IF EXISTS change_set_items_record_type_check;
+ALTER TABLE change_set_items ADD CONSTRAINT change_set_items_record_type_check CHECK (record_type IN ('belief','evidence','task','experiment','decision','recommendation'));
 
 DROP TRIGGER IF EXISTS change_sets_updated_at ON change_sets;
 CREATE TRIGGER change_sets_updated_at BEFORE UPDATE ON change_sets FOR EACH ROW EXECUTE FUNCTION set_updated_at();

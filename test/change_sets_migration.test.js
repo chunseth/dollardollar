@@ -12,7 +12,7 @@ test("Phase 5 migration defines bounded change-set lifecycle, JSON checks, and r
     "UNIQUE (project_id, idempotency_key)", "UNIQUE (change_set_id, sequence_number)",
     "jsonb_typeof(original_payload) = 'object'", "jsonb_typeof(current_payload) = 'object'",
     "change_sets_project_pending_review_idx", "change_sets_project_lifecycle_idx",
-    "change_set_items_change_set_review_idx"
+    "change_set_items_change_set_review_idx", "recommendation"
   ]) assert.match(migration, new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.match(migration, /status IN \('pending_review','partially_approved','approved','rejected','applying','applied','failed','expired'\)/);
   assert.match(migration, /operation IN \('create','update','link'\)/);
@@ -22,7 +22,7 @@ test("Phase 5 migration defines bounded change-set lifecycle, JSON checks, and r
 function clone(value) { return JSON.parse(JSON.stringify(value)); }
 
 function createStore() {
-  let state = { sets: [], items: [], tasks: [], events: [], calls: [], nextSet: 1, nextItem: 1, nextTask: 1 };
+  let state = { sets: [], items: [], tasks: [], beliefs: [], versions: [], events: [], calls: [], nextSet: 1, nextItem: 1, nextTask: 1, nextBelief: 1, nextVersion: 1, nextEvent: 1 };
   const result = rows => ({ rows, rowCount: rows.length });
   const query = async (sql, params = []) => {
     const text = sql.replace(/\s+/g, " ").trim().toLowerCase();
@@ -58,6 +58,10 @@ function createStore() {
     if (text.startsWith("update change_set_items set review_status='applied'")) {
       const item = state.items.find(candidate => candidate.id === params[0]); item.review_status = "applied"; item.application_result_metadata = params[1]; return result([item]);
     }
+    if (text.startsWith("insert into beliefs")) { const belief = { id: `belief-${state.nextBelief++}`, project_id: params[0] }; state.beliefs.push(belief); return result([belief]); }
+    if (text.startsWith("insert into belief_versions")) { const version = { id: `version-${state.nextVersion++}`, belief_id: params[0], source_turn_id: params[8], source_user_id: params[9] }; state.versions.push(version); return result([version]); }
+    if (text.startsWith("update beliefs set current_version_id")) return result([]);
+    if (text.startsWith("update belief_versions set source_event_id")) { const version = state.versions.find(candidate => candidate.id === params[2]); version.source_event_id = params[0]; version.source_user_id = params[1]; return result([]); }
     if (text.startsWith("update change_sets set status='approved'")) { const set = state.sets.find(candidate => candidate.id === params[0]); set.status = "approved"; set.approved_by = params[1]; return result([set]); }
     if (text.startsWith("update change_sets set status=$2")) { const set = state.sets.find(candidate => candidate.id === params[0]); set.status = params[1]; return result([set]); }
     if (text.startsWith("update change_sets set status='rejected'")) { const set = state.sets.find(candidate => candidate.id === params[0]); set.status = "rejected"; return result([set]); }
@@ -65,7 +69,7 @@ function createStore() {
     if (text.startsWith("update change_sets set status='applied'")) { const set = state.sets.find(candidate => candidate.id === params[0]); set.status = "applied"; set.application_metadata = params[2]; return result([set]); }
     if (text.startsWith("update change_sets set status='failed'")) { const set = state.sets.find(candidate => candidate.id === params[0] && candidate.project_id === params[2] && ["approved", "applying"].includes(candidate.status)); if (!set) return result([]); set.status = "failed"; set.application_metadata = { ...set.application_metadata, ...JSON.parse(params[1]) }; return result([set]); }
     if (text.startsWith("insert into tasks")) { if (params.includes("__FAIL__")) throw new Error("forced task insert failure"); const task = { id: `task-${state.nextTask++}`, project_id: params[0], title: params[1] }; state.tasks.push(task); return result([task]); }
-    if (text.startsWith("insert into event_log")) { const event = { project_id: params[0], actor_type: params[1], actor_id: params[2], event_type: params[3], entity_type: params[4], entity_id: params[5], payload: params[7] }; state.events.push(event); return result([event]); }
+    if (text.startsWith("insert into event_log")) { const event = { id: `event-${state.nextEvent++}`, project_id: params[0], actor_type: params[1], actor_id: params[2], event_type: params[3], entity_type: params[4], entity_id: params[5], payload: params[7] }; state.events.push(event); return result([event]); }
     throw new Error(`Unhandled test query: ${text}`);
   };
   return {
@@ -95,6 +99,8 @@ test("change-set proposal validation and idempotency are deterministic", async (
   assert.equal(store.state.sets.length, 1);
   assert.deepEqual(store.state.events.map(event => event.event_type), ["proposed"]);
   assert.equal(store.state.events[0].actor_type, "ai");
+  const withRecommendation = await service.proposeChangeSet("project-1", { source_turn_id: "turn-1", idempotency_key: "recommendation", items: [], recommendation: { state: "question", primary_issue: "No payment evidence", reason: "A founder answer is needed.", action_payload: {}, confidence: 0.7, source_ids: ["turn-1"] } });
+  assert.equal(withRecommendation.items[0].record_type, "recommendation");
 });
 
 test("founder review workflow enforces authorization, edit, selected approval, full approval, and rejection", async () => {
@@ -126,4 +132,14 @@ test("approved application is atomic, audited, and records failure separately wi
   assert.equal(store.state.items.find(item => item.change_set_id === failed.id).review_status, "approved");
   assert.deepEqual(store.state.events.filter(event => event.entity_id === failed.id).map(event => event.event_type), ["proposed", "approved", "failed"]);
   assert.equal(store.state.events.filter(event => event.event_type === "applied").length, 2);
+});
+
+test("approved belief application preserves source turn and records application event provenance", async () => {
+  const store = createStore(), service = loadService(store);
+  const set = await service.proposeChangeSet("project-1", { source_turn_id: "turn-1", idempotency_key: "belief", items: [{ record_type: "belief", operation: "create", payload: { statement: "Founders will pay for the pilot", classification: "hypothesis", source_ids: ["turn-1"] } }] });
+  await service.approveChangeSet("project-1", set.id, { actor_id: "founder-1" });
+  await service.applyApprovedChangeSet("project-1", set.id, { actor_id: "founder-1" });
+  assert.equal(store.state.versions[0].source_turn_id, "turn-1");
+  assert.equal(store.state.versions[0].source_user_id, "founder-1");
+  assert.match(store.state.versions[0].source_event_id, /^event-/);
 });
