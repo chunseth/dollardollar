@@ -28,9 +28,12 @@ async function assumptionFor(client, assumption) {
   return result.rows[0];
 }
 
-async function createBeliefFromAssumption(first, second, third) {
-  if (!isExecutor(first)) return transaction(client => createBeliefFromAssumption(client, first, second));
-  const client = first, assumption = await assumptionFor(client, second), provenance = third || {};
+async function createBeliefFromAssumption(first, second, third, fourth) {
+  if (!isExecutor(first)) return transaction(client => createBeliefFromAssumption(client, first, second, third));
+  const client = first, assumption = await assumptionFor(client, second), provenance = third || {}, options = fourth || {};
+  const expectedProjectId = (typeof options === "string" ? options : options.projectId || options.expectedProjectId) || provenance.projectId || provenance.expectedProjectId;
+  if (!expectedProjectId) throw new Error("createBeliefFromAssumption requires projectId");
+  if (expectedProjectId && assumption.project_id !== expectedProjectId) throw new Error("Assumption must belong to the expected project");
   const existing = await client.query("SELECT id FROM beliefs WHERE origin_assumption_id=$1", [assumption.id]);
   if (existing.rowCount) return beliefById(client, existing.rows[0].id);
   const belief = (await client.query("INSERT INTO beliefs (project_id,origin_assumption_id) VALUES ($1,$2) RETURNING *", [assumption.project_id, assumption.id])).rows[0];
@@ -53,9 +56,13 @@ async function beliefById(client, beliefId) {
 async function appendBeliefVersion(first, second, third) {
   if (!isExecutor(first)) return transaction(client => appendBeliefVersion(client, first, second));
   const client = first, beliefId = second, changes = third || {};
-  const current = await client.query("SELECT b.id, b.is_active, bv.* FROM beliefs b JOIN belief_versions bv ON bv.id=b.current_version_id WHERE b.id=$1 FOR UPDATE", [beliefId]);
+  const current = await client.query("SELECT b.id, b.project_id, b.is_active, bv.* FROM beliefs b JOIN belief_versions bv ON bv.id=b.current_version_id WHERE b.id=$1 FOR UPDATE", [beliefId]);
   if (!current.rowCount) throw new Error("Belief not found");
   const prior = current.rows[0];
+  if (has(changes, "source_assumption_id") && changes.source_assumption_id) {
+    const sourceAssumption = await client.query("SELECT project_id FROM assumptions WHERE id=$1", [changes.source_assumption_id]);
+    if (!sourceAssumption.rowCount || sourceAssumption.rows[0].project_id !== prior.project_id) throw new Error("Source assumption must belong to the same project as the belief");
+  }
   const value = key => has(changes, key) ? changes[key] : prior[key];
   const nextNumber = Number(prior.version_number) + 1;
   const inserted = (await client.query(

@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 require("../env").loadEnv();
+const { normalizeDraft } = require("../onboarding");
 
 if (!process.env.DATABASE_URL) {
   test("Milestone 2 API smoke tests", { skip: "DATABASE_URL is not set" }, () => {});
@@ -50,6 +51,8 @@ if (!process.env.DATABASE_URL) {
     assert.equal(updated.project.pricing_hypothesis, "$25/month");
 
     const assumption = (await json(await api(`/api/projects/${projectId}/assumptions`, { method: "POST", body: { statement: "Founders will pay for guided validation", category: "Willingness to pay", risk_score: 77 } }))).assumption;
+    const initialBelief = (await pool.query("SELECT b.id, b.current_version_id FROM beliefs b WHERE b.origin_assumption_id=$1", [assumption.id])).rows[0];
+    assert.ok(initialBelief);
     const evidence = (await json(await api(`/api/projects/${projectId}/evidence`, { method: "POST", body: { source_type: "customer_interview", source_title: "Founder call", summary: "The founder asked for pricing after the demo." } }))).evidence;
     const experiment = (await json(await api(`/api/projects/${projectId}/experiments`, { method: "POST", body: { assumption_id: assumption.id, title: "Paid pilot ask", hypothesis: "Founders will commit to a paid pilot", success_metric: "Two commitments" } }))).experiment;
     const task = (await json(await api(`/api/projects/${projectId}/tasks`, { method: "POST", body: { assumption_id: assumption.id, experiment_id: experiment.id, title: "Ask five founders for paid pilots" } }))).task;
@@ -60,6 +63,17 @@ if (!process.env.DATABASE_URL) {
     const assumptionEvidence = (await json(await api(`/api/projects/${projectId}/assumption-evidence`, { method: "POST", body: { assumption_id: assumption.id, evidence_id: evidence.id, relationship: "supports" } }))).link;
     const duplicateAssumptionEvidence = (await json(await api(`/api/projects/${projectId}/assumption-evidence`, { method: "POST", body: { assumption_id: assumption.id, evidence_id: evidence.id, relationship: "supports" } }))).link;
     assert.equal(duplicateAssumptionEvidence.id, assumptionEvidence.id);
+    assert.equal(assumptionEvidence.belief_version_id, initialBelief.current_version_id);
+    assert.equal((await pool.query("SELECT count(*)::int AS count FROM belief_evidence_links WHERE belief_version_id=$1 AND evidence_id=$2", [initialBelief.current_version_id, evidence.id])).rows[0].count, 1);
+
+    await json(await api(`/api/projects/${projectId}/assumptions/${assumption.id}`, { method: "PATCH", body: { statement: "Founders will pay at least $25 for guided validation", category: "willingness_to_pay" } }));
+    const versions = await pool.query("SELECT id, version_number, statement FROM belief_versions WHERE belief_id=$1 ORDER BY version_number", [initialBelief.id]);
+    assert.deepEqual(versions.rows.map(row => row.version_number), [1, 2]);
+    assert.equal(versions.rows[0].statement, "Founders will pay for guided validation");
+    assert.equal(versions.rows[1].statement, "Founders will pay at least $25 for guided validation");
+    const laterEvidence = (await json(await api(`/api/projects/${projectId}/evidence`, { method: "POST", body: { source_type: "payment", source_title: "Pilot deposit", summary: "A founder paid a $25 pilot deposit." } }))).evidence;
+    const laterLink = (await json(await api(`/api/projects/${projectId}/assumption-evidence`, { method: "POST", body: { assumption_id: assumption.id, evidence_id: laterEvidence.id, relationship: "supports" } }))).link;
+    assert.equal(laterLink.belief_version_id, versions.rows[1].id);
 
     for (const body of [
       { type: "assumption_experiment", assumption_id: assumption.id, experiment_id: experiment.id },
@@ -109,6 +123,17 @@ if (!process.env.DATABASE_URL) {
     assert.equal(beliefs.rowCount, 1);
     assert.equal(beliefs.rows[0].version_number, 1);
     assert.equal(beliefs.rows[0].statement, draft.assumptions[0].statement);
+    assert.equal((await api(`/api/projects/${created.project.id}`, { method: "DELETE" })).status, 204);
+  });
+
+  test("onboarding does not create beliefs for rejected assumptions", async () => {
+    const draft = normalizeDraft({ profile: { name: { value: "Rejected belief onboarding", confidence: "high" } }, assumptions: [{ statement: "At least 3 of 10 operators will agree to a paid pilot.", validation_criterion: "At least 3 of 10 operators will agree to a paid pilot.", category: "willingness_to_pay", priority: "high", risk_score: 80, rationale: "Payment validates demand." }, { statement: "At least 3 of 10 operators will sign a one-year contract.", validation_criterion: "At least 3 of 10 operators will sign a one-year contract.", category: "willingness_to_pay", priority: "high", risk_score: 80, rationale: "This remains unaccepted." }], tasks: [] });
+    const created = await json(await api("/api/onboarding/confirm", { method: "POST", body: { draft, accepted: { profile: ["name"], assumptions: [draft.assumptions[0].draft_id], tasks: [] } } }));
+    const beliefs = await pool.query("SELECT b.origin_assumption_id FROM beliefs b WHERE b.project_id=$1", [created.project.id]);
+    const assumptions = await pool.query("SELECT statement FROM assumptions WHERE project_id=$1", [created.project.id]);
+    assert.equal(beliefs.rowCount, 1);
+    assert.equal(assumptions.rowCount, 1);
+    assert.equal(assumptions.rows[0].statement, draft.assumptions[0].statement);
     assert.equal((await api(`/api/projects/${created.project.id}`, { method: "DELETE" })).status, 204);
   });
 

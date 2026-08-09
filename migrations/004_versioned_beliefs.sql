@@ -51,3 +51,32 @@ CREATE INDEX IF NOT EXISTS beliefs_project_active_idx ON beliefs(project_id, cre
 CREATE INDEX IF NOT EXISTS belief_versions_belief_version_idx ON belief_versions(belief_id, version_number DESC);
 CREATE INDEX IF NOT EXISTS belief_evidence_links_version_idx ON belief_evidence_links(belief_version_id);
 CREATE INDEX IF NOT EXISTS belief_evidence_links_evidence_idx ON belief_evidence_links(evidence_id);
+
+-- Project pre-existing assumptions into the versioned model when this migration
+-- is applied to an existing database. New assumptions are projected by the API.
+INSERT INTO beliefs (project_id, origin_assumption_id)
+SELECT a.project_id, a.id
+FROM assumptions a
+WHERE NOT EXISTS (
+  SELECT 1 FROM beliefs b WHERE b.origin_assumption_id = a.id
+);
+
+INSERT INTO belief_versions (
+  belief_id, version_number, statement, classification, validation_status,
+  confidence, importance, source_assumption_id, source_identifier, provenance
+)
+SELECT b.id, 1, a.statement, a.category, a.status,
+       a.confidence, a.importance, a.id, 'migration_004',
+       '{"migration":"004_versioned_beliefs"}'::jsonb
+FROM beliefs b
+JOIN assumptions a ON a.id = b.origin_assumption_id
+WHERE NOT EXISTS (
+  SELECT 1 FROM belief_versions bv WHERE bv.belief_id = b.id
+);
+
+UPDATE beliefs b
+SET current_version_id = bv.id
+FROM belief_versions bv
+WHERE bv.belief_id = b.id
+  AND bv.version_number = 1
+  AND b.current_version_id IS NULL;

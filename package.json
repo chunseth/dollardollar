@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "start": "node server.js",
-    "test": "node --test && node --check app.js && node --check beliefs.js && node --check env.js && node --check server.js && node --check onboarding.js && node --check scripts/seed.js",
+    "test": "npm run db:migrate && node --test && node --check app.js && node --check beliefs.js && node --check env.js && node --check server.js && node --check onboarding.js && node --check scripts/seed.js",
     "db:migrate": "node scripts/migrate.js",
     "db:seed": "node scripts/seed.js"
   },
