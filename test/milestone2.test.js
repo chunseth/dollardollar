@@ -1,5 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+require("../env").loadEnv();
 
 if (!process.env.DATABASE_URL) {
   test("Milestone 2 API smoke tests", { skip: "DATABASE_URL is not set" }, () => {});

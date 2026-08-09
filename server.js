@@ -57,7 +57,37 @@ async function fullMemory(projectId) {
   return { project: project.rows[0], assumptions: assumptions.rows, evidence: evidence.rows, experiments: experiments.rows, tasks: tasks.rows, decisions: decisions.rows, roadmap_milestones: milestones.rows, assumption_evidence: links.rows, events: events.rows };
 }
 
-async function api(request, response, url, generatePlan = createPlan) {
+const chatPromptVersion = "conversation-loop-v1";
+const placeholderModel = "local-placeholder";
+function memoryRecordIds(memory) {
+  return Object.fromEntries(Object.entries(memory).map(([name, records]) => [name, Array.isArray(records) ? records.map(record => String(record.id)).filter(Boolean) : records?.id ? [String(records.id)] : []]));
+}
+function validateAssistantPayload(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw Object.assign(new Error("Assistant payload must be an object"), { status: 502 });
+  for (const field of ["assistant_message", "model", "prompt_version"]) if (typeof payload[field] !== "string" || !payload[field].trim()) throw Object.assign(new Error(`Assistant payload requires ${field}`), { status: 502 });
+  if (!payload.structured_payload || typeof payload.structured_payload !== "object" || Array.isArray(payload.structured_payload)) throw Object.assign(new Error("Assistant payload requires structured_payload to be an object"), { status: 502 });
+  if (!payload.recommendation || typeof payload.recommendation !== "object" || Array.isArray(payload.recommendation)) throw Object.assign(new Error("Assistant payload requires recommendation to be an object"), { status: 502 });
+  if (!payload.included_memory_record_ids || typeof payload.included_memory_record_ids !== "object" || Array.isArray(payload.included_memory_record_ids)) throw Object.assign(new Error("Assistant payload requires included_memory_record_ids to be an object"), { status: 502 });
+  return payload;
+}
+// `createServer({ generateAssistant })` is the test seam. It accepts exactly this
+// JSON-safe payload shape and never reads a request-supplied assistant payload.
+// Production currently uses this stable placeholder instead of making an OpenAI call.
+function placeholderAssistant({ contextPacket, founderTurn }) {
+  return {
+    assistant_message: "I saved your message. AI responses are not configured yet, so I cannot generate a substantive recommendation.",
+    model: placeholderModel,
+    prompt_version: chatPromptVersion,
+    structured_payload: { mode: "placeholder", reason: "No assistant generator is configured." },
+    recommendation: { state: "question", primary_issue: "Assistant configuration is pending", reason: "This is a stable local placeholder response.", action_payload: {}, confidence: 0, source_ids: [contextPacket.id, founderTurn.id] },
+    included_memory_record_ids: contextPacket.included_memory_record_ids
+  };
+}
+async function chatHistory(projectId) {
+  return (await query("SELECT id, session_id, context_packet_id, turn_no, actor_type, content, model, prompt_version, structured_payload, created_at FROM conversation_turns WHERE project_id=$1 ORDER BY created_at ASC, turn_no ASC", [projectId])).rows;
+}
+
+async function api(request, response, url, generatePlan = createPlan, generateAssistant = placeholderAssistant) {
   const parts = url.pathname.split("/").filter(Boolean); const method = request.method; const owner = userId(request);
   if (url.pathname === "/api/onboarding/draft" && method === "POST") { if (!allowDraft(request)) return fail(response, 429, "Too many onboarding drafts. Please wait a minute and try again."); const draft = await createDraft(await readBody(request)); return send(response, 200, { draft, requires_follow_up: draft.requires_follow_up === true }); }
   if (url.pathname === "/api/onboarding/confirm" && method === "POST") {
@@ -93,6 +123,33 @@ async function api(request, response, url, generatePlan = createPlan) {
   if (parts.length === 2 && method === "GET") return send(response, 200, { projects: (await query("SELECT * FROM projects WHERE user_id=$1 ORDER BY updated_at DESC", [owner])).rows });
   if (parts.length === 2 && method === "POST") { const body = await readBody(request); const values = pick(body, projectFields), errors = validateProject(values); if (!values.name || !String(values.name).trim() || errors) return fail(response, 422, "Invalid project", { ...(!values.name || !String(values.name).trim() ? { name: "is required" } : {}), ...(errors || {}) }); const result = await transaction(async client => { const fields = ["user_id", ...Object.keys(values)], params = [owner, ...Object.values(values)]; const row = (await client.query(`INSERT INTO projects (${fields.join(",")}) VALUES (${fields.map((_, i) => `$${i + 1}`).join(",")}) RETURNING *`, params)).rows[0]; await log(client, row.id, "founder", "created", "project", row.id, `Created project ${row.name}`, values); return row; }); return send(response, 201, { project: result }); }
   const projectId = parts[2], existingProject = validUuid(projectId) ? await ownedProject(projectId, owner) : null; if (!existingProject) return fail(response, 404, "Project not found");
+  if (parts[3] === "chat" && parts.length === 4 && method === "GET") return send(response, 200, { turns: await chatHistory(projectId) });
+  if (parts[3] === "recommendation" && parts.length === 4 && method === "GET") {
+    const recommendation = (await query("SELECT id, context_packet_id, recommendation, created_at FROM recommendations WHERE project_id=$1 AND status='active' ORDER BY created_at DESC LIMIT 1", [projectId])).rows[0];
+    return send(response, 200, { recommendation: recommendation || null });
+  }
+  if (parts[3] === "chat" && parts.length === 4 && method === "POST") {
+    const body = await readBody(request);
+    if (typeof body.message !== "string" || !body.message.trim()) return fail(response, 422, "Chat message is required");
+    if (body.message.length > 20_000) return fail(response, 422, "Chat message must be 20,000 characters or fewer");
+    const result = await transaction(async client => {
+      let session = (await client.query("SELECT id FROM conversation_sessions WHERE project_id=$1 AND status='open' ORDER BY created_at DESC LIMIT 1 FOR UPDATE", [projectId])).rows[0];
+      if (!session) session = (await client.query("INSERT INTO conversation_sessions (project_id, initiated_by) VALUES ($1,'founder') RETURNING id", [projectId])).rows[0];
+      const memory = await fullMemory(projectId);
+      const includedMemoryRecordIds = memoryRecordIds(memory);
+      const contextPacket = (await client.query("INSERT INTO context_packets (project_id,purpose,data,included_memory_record_ids) VALUES ($1,'chat_turn',$2,$3) RETURNING *", [projectId, { project: memory.project, memory_record_ids: includedMemoryRecordIds }, includedMemoryRecordIds])).rows[0];
+      const nextTurn = (await client.query("SELECT COALESCE(MAX(turn_no),0)+1 AS turn_no FROM conversation_turns WHERE session_id=$1", [session.id])).rows[0].turn_no;
+      const founderTurn = (await client.query("INSERT INTO conversation_turns (session_id,project_id,context_packet_id,turn_no,actor_type,content) VALUES ($1,$2,$3,$4,'founder',$5) RETURNING *", [session.id, projectId, contextPacket.id, nextTurn, body.message.trim()])).rows[0];
+      const payload = validateAssistantPayload(await generateAssistant({ project: existingProject, message: founderTurn.content, contextPacket, founderTurn }));
+      const assistantTurn = (await client.query("INSERT INTO conversation_turns (session_id,project_id,context_packet_id,turn_no,actor_type,content,model,prompt_version,structured_payload) VALUES ($1,$2,$3,$4,'ai',$5,$6,$7,$8) RETURNING *", [session.id, projectId, contextPacket.id, Number(nextTurn) + 1, payload.assistant_message, payload.model, payload.prompt_version, payload.structured_payload])).rows[0];
+      await client.query("UPDATE recommendations SET status='superseded' WHERE project_id=$1 AND status='active'", [projectId]);
+      const recommendation = (await client.query("INSERT INTO recommendations (project_id,context_packet_id,recommendation) VALUES ($1,$2,$3) RETURNING id, context_packet_id, recommendation, created_at", [projectId, contextPacket.id, payload.recommendation])).rows[0];
+      await log(client, projectId, "founder", "created", "conversation_turn", founderTurn.id, "Created founder chat turn", { context_packet_id: contextPacket.id });
+      await log(client, projectId, "ai", "generated", "conversation_turn", assistantTurn.id, "Generated assistant chat turn", { context_packet_id: contextPacket.id, model: payload.model, prompt_version: payload.prompt_version });
+      return { founder_turn: founderTurn, assistant_turn: assistantTurn, context_packet: contextPacket, recommendation };
+    });
+    return send(response, 201, result);
+  }
   if (parts[3] === "memory" && method === "GET") return send(response, 200, await fullMemory(projectId));
   if (parts[3] === "plan" && method === "POST") {
     const assumptions = (await query("SELECT id, statement, category, priority, subcategory FROM assumptions WHERE project_id=$1 ORDER BY risk_score DESC, created_at", [projectId])).rows;
@@ -126,11 +183,11 @@ async function api(request, response, url, generatePlan = createPlan) {
   return false;
 }
 
-function createServer({ generatePlan = createPlan } = {}) {
+function createServer({ generatePlan = createPlan, generateAssistant = placeholderAssistant } = {}) {
 const server = http.createServer(async (request, response) => {
   try {
     const url = new URL(request.url, `http://${request.headers.host}`);
-    if (url.pathname.startsWith("/api/")) { const handled = await api(request, response, url, generatePlan); if (!handled) fail(response, 404, "API route not found"); return; }
+    if (url.pathname.startsWith("/api/")) { const handled = await api(request, response, url, generatePlan, generateAssistant); if (!handled) fail(response, 404, "API route not found"); return; }
     if (request.method !== "GET" && request.method !== "HEAD") return fail(response, 405, "Method not allowed");
     const requestedPath = url.pathname === "/" ? "/index.html" : url.pathname; const filePath = path.normalize(path.join(root, requestedPath));
     if (!filePath.startsWith(root + path.sep)) return fail(response, 403, "Forbidden");
@@ -151,4 +208,4 @@ function startupGuard() {
 
 if (require.main === module) { startupGuard(); createServer().listen(port, () => console.log(`First Dollar is running at http://localhost:${port}`)); }
 
-module.exports = { createServer, startupGuard };
+module.exports = { createServer, startupGuard, placeholderAssistant, validateAssistantPayload, memoryRecordIds };
