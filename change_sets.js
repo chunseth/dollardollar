@@ -2,7 +2,7 @@
 
 const { query, transaction } = require("./db");
 const { appendBeliefVersion, linkEvidenceToBeliefVersion } = require("./beliefs");
-const { nextStates, beliefClassifications } = require("./ai_cofounder_contract");
+const { nextStates, beliefClassifications, validateCofounderOutput } = require("./ai_cofounder_contract");
 const { topUnresolvedIssue } = require("./context");
 
 const TYPES = new Set(["belief", "evidence", "task", "experiment", "decision", "recommendation"]);
@@ -55,7 +55,11 @@ async function sourceIds(client, projectId, ids) {
   }
 }
 async function currentTopIssue(client, projectId) {
-  const [assumptions, evidence, tasks, experiments, links] = await Promise.all(["assumptions", "evidence", "tasks", "experiments"].map(table => client.query(`SELECT * FROM ${table} WHERE project_id=$1`, [projectId])).concat(client.query("SELECT ae.* FROM assumption_evidence ae JOIN assumptions a ON a.id=ae.assumption_id WHERE a.project_id=$1", [projectId])));
+  const assumptions = await client.query("SELECT * FROM assumptions WHERE project_id=$1", [projectId]);
+  const evidence = await client.query("SELECT * FROM evidence WHERE project_id=$1", [projectId]);
+  const tasks = await client.query("SELECT * FROM tasks WHERE project_id=$1", [projectId]);
+  const experiments = await client.query("SELECT * FROM experiments WHERE project_id=$1", [projectId]);
+  const links = await client.query("SELECT ae.* FROM assumption_evidence ae JOIN assumptions a ON a.id=ae.assumption_id WHERE a.project_id=$1", [projectId]);
   return topUnresolvedIssue({ assumptions: assumptions.rows, evidence: evidence.rows, tasks: tasks.rows, experiments: experiments.rows, assumption_evidence: links.rows });
 }
 async function validateItem(client, projectId, item, expectedTopIssue) {
@@ -71,6 +75,7 @@ async function validateItem(client, projectId, item, expectedTopIssue) {
   await sourceIds(client, projectId, payload.source_ids);
   if (payload.assumption_id) await owns(client, "assumptions", projectId, payload.assumption_id, "Assumption");
   if (payload.experiment_id) await owns(client, "experiments", projectId, payload.experiment_id, "Experiment");
+  if (payload.source_assumption_id) await owns(client, "assumptions", projectId, payload.source_assumption_id, "Source assumption");
   if (record_type === "belief") {
     if (operation === "create" && (!nonEmpty(payload.statement) || !beliefClassifications.includes(payload.classification))) throw fail("New belief proposals require a valid statement and classification");
     if (payload.statement !== undefined && !nonEmpty(payload.statement)) throw fail("Belief statement must be non-empty");
@@ -103,6 +108,13 @@ async function proposeChangeSet(projectId, aiPayload, options = {}) {
     const origin = options.origin || aiPayload.origin || "ai", source_turn_id = options.source_turn_id || aiPayload.source_turn_id;
     if (origin !== "ai") throw fail("This proposal boundary only accepts AI-originated change sets");
     if (!nonEmpty(source_turn_id)) throw fail("AI change sets require source_turn_id"); await sourceTurn(client, projectId, source_turn_id);
+    if (Array.isArray(aiPayload.items)) {
+      // The compact items form is reserved for trusted internal callers and
+      // is never accepted from the public cofounder-output boundary.
+      if (options.internal !== true) throw fail("Custom change-set items are internal-only; submit the Phase 1 cofounder output envelope");
+    } else {
+      try { validateCofounderOutput(aiPayload); } catch (error) { throw fail(`Invalid cofounder output: ${error.message}`); }
+    }
     const rawItems = normalizedItems(aiPayload); if (!rawItems.length || rawItems.length > MAX_ITEMS) throw fail("Change set must contain a bounded number of items");
     const top = await currentTopIssue(client, projectId), items = [];
     for (const item of rawItems) items.push(await validateItem(client, projectId, item, top));

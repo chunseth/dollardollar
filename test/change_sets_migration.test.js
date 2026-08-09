@@ -30,6 +30,7 @@ function createStore() {
     if (text.startsWith("select user_id from projects")) return result([{ user_id: "founder-1" }]);
     if (text.startsWith("select id from projects")) return result([{ id: params[0] }]);
     if (text.startsWith("select id from conversation_turns")) return result(params[0] === "turn-1" ? [{ id: "turn-1" }] : []);
+    if (text.startsWith("select id from assumptions")) return result(params[0] === "assumption-1" ? [{ id: params[0] }] : []);
     if (text.startsWith("select * from assumptions") || text.startsWith("select * from evidence") || text.startsWith("select * from tasks where project_id") || text.startsWith("select * from experiments") || text.startsWith("select ae.* from assumption_evidence")) return result([]);
     if (text.startsWith("select * from change_sets where project_id")) return result(state.sets.filter(set => set.project_id === params[0] && set.idempotency_key === params[1]));
     if (text.startsWith("insert into change_sets")) {
@@ -90,22 +91,26 @@ const proposal = (key, title = "Call five founders") => ({ source_turn_id: "turn
 
 test("change-set proposal validation and idempotency are deterministic", async () => {
   const store = createStore(), service = loadService(store);
-  await assert.rejects(() => service.proposeChangeSet("project-1", { ...proposal("bad"), items: [{ record_type: "evidence", operation: "create", payload: { source_ids: ["turn-1"] } }] }), /Evidence proposals require/);
-  await assert.rejects(() => service.proposeChangeSet("project-1", { ...proposal("bad-link"), items: [{ record_type: "task", operation: "link", target_entity_id: "task-1", payload: { source_ids: ["turn-1"] } }] }), /Link operations are only supported/);
-  const created = await service.proposeChangeSet("project-1", proposal("same-key"));
-  const reused = await service.proposeChangeSet("project-1", proposal("same-key"));
+  await assert.rejects(() => service.proposeChangeSet("project-1", { ...proposal("bad"), items: [{ record_type: "evidence", operation: "create", payload: { source_ids: ["turn-1"] } }] }, { internal: true }), /Evidence proposals require/);
+  await assert.rejects(() => service.proposeChangeSet("project-1", { ...proposal("bad-link"), items: [{ record_type: "task", operation: "link", target_entity_id: "task-1", payload: { source_ids: ["turn-1"] } }] }, { internal: true }), /Link operations are only supported/);
+  const created = await service.proposeChangeSet("project-1", proposal("same-key"), { internal: true });
+  const reused = await service.proposeChangeSet("project-1", proposal("same-key"), { internal: true });
   assert.equal(created.reused, false);
   assert.equal(reused.reused, true);
   assert.equal(store.state.sets.length, 1);
   assert.deepEqual(store.state.events.map(event => event.event_type), ["proposed"]);
   assert.equal(store.state.events[0].actor_type, "ai");
-  const withRecommendation = await service.proposeChangeSet("project-1", { source_turn_id: "turn-1", idempotency_key: "recommendation", items: [], recommendation: { state: "question", primary_issue: "No payment evidence", reason: "A founder answer is needed.", action_payload: {}, confidence: 0.7, source_ids: ["turn-1"] } });
+  const withRecommendation = await service.proposeChangeSet("project-1", { source_turn_id: "turn-1", idempotency_key: "recommendation", items: [], recommendation: { state: "question", primary_issue: "No payment evidence", reason: "A founder answer is needed.", action_payload: {}, confidence: 0.7, source_ids: ["turn-1"] } }, { internal: true });
   assert.equal(withRecommendation.items[0].record_type, "recommendation");
+  await assert.rejects(() => service.proposeChangeSet("project-1", proposal("custom-public")), /Custom change-set items are internal-only/);
+  const standard = await service.proposeChangeSet("project-1", { source_turn_id: "turn-1", idempotency_key: "standard", assistant_message: "I need one answer.", proposed_belief_updates: [], proposed_records: [{ type: "task", payload: { title: "Ask five founders" }, source_ids: ["turn-1"] }], recommendation: { state: "task", primary_issue: "No payment evidence", reason: "A paid ask tests demand.", action_payload: { title: "Ask five founders" }, confidence: 0.6, source_ids: ["turn-1"] }, needs_founder_review: true });
+  assert.equal(standard.items.length, 2);
+  await assert.rejects(() => service.proposeChangeSet("project-1", { ...proposal("cross-project-assumption"), items: [{ record_type: "belief", operation: "create", payload: { statement: "Cross-project", classification: "hypothesis", source_assumption_id: "assumption-foreign", source_ids: ["turn-1"] } }] }, { internal: true }), /Source assumption must belong/);
 });
 
 test("founder review workflow enforces authorization, edit, selected approval, full approval, and rejection", async () => {
   const store = createStore(), service = loadService(store);
-  const set = await service.proposeChangeSet("project-1", { ...proposal("review"), items: [proposal("a").items[0], proposal("b", "Send follow-up").items[0]] });
+  const set = await service.proposeChangeSet("project-1", { ...proposal("review"), items: [proposal("a").items[0], proposal("b", "Send follow-up").items[0]] }, { internal: true });
   await assert.rejects(() => service.approveChangeSet("project-1", set.id), /Founder authorization context is required/);
   await assert.rejects(() => service.approveChangeSet("project-1", set.id, { actor_id: "someone-else" }), /not authorized/);
   await service.editChangeSetItem("project-1", set.id, set.items[1].id, { title: "Send a tailored follow-up", source_ids: ["turn-1"], justification: "Keeps the proposal focused." }, { actor_id: "founder-1" });
@@ -113,18 +118,18 @@ test("founder review workflow enforces authorization, edit, selected approval, f
   assert.equal(partial.status, "partially_approved");
   const approved = await service.approveChangeSet("project-1", set.id, { actor_id: "founder-1" });
   assert.equal(approved.status, "approved");
-  const rejected = await service.proposeChangeSet("project-1", proposal("reject"));
+  const rejected = await service.proposeChangeSet("project-1", proposal("reject"), { internal: true });
   assert.equal((await service.rejectChangeSet("project-1", rejected.id, { actor_id: "founder-1" }, "Not now")).status, "rejected");
   assert.deepEqual(store.state.events.map(event => event.event_type), ["proposed", "edited", "approved_selected", "approved", "proposed", "rejected"]);
 });
 
 test("approved application is atomic, audited, and records failure separately without retaining item writes", async () => {
   const store = createStore(), service = loadService(store);
-  const success = await service.proposeChangeSet("project-1", proposal("apply"));
+  const success = await service.proposeChangeSet("project-1", proposal("apply"), { internal: true });
   await service.approveChangeSet("project-1", success.id, { actor_id: "founder-1" });
   assert.equal((await service.applyApprovedChangeSet("project-1", success.id, { actor_id: "founder-1" })).status, "applied");
   assert.equal((await service.applyApprovedChangeSet("project-1", success.id, { actor_id: "founder-1" })).idempotent, true);
-  const failed = await service.proposeChangeSet("project-1", { ...proposal("fail", "__FAIL__"), idempotency_key: "fail" });
+  const failed = await service.proposeChangeSet("project-1", { ...proposal("fail", "__FAIL__"), idempotency_key: "fail" }, { internal: true });
   await service.approveChangeSet("project-1", failed.id, { actor_id: "founder-1" });
   await assert.rejects(() => service.applyApprovedChangeSet("project-1", failed.id, { actor_id: "founder-1" }), /forced task insert failure/);
   assert.equal(store.state.tasks.length, 1);
@@ -136,7 +141,7 @@ test("approved application is atomic, audited, and records failure separately wi
 
 test("approved belief application preserves source turn and records application event provenance", async () => {
   const store = createStore(), service = loadService(store);
-  const set = await service.proposeChangeSet("project-1", { source_turn_id: "turn-1", idempotency_key: "belief", items: [{ record_type: "belief", operation: "create", payload: { statement: "Founders will pay for the pilot", classification: "hypothesis", source_ids: ["turn-1"] } }] });
+  const set = await service.proposeChangeSet("project-1", { source_turn_id: "turn-1", idempotency_key: "belief", items: [{ record_type: "belief", operation: "create", payload: { statement: "Founders will pay for the pilot", classification: "hypothesis", source_ids: ["turn-1"] } }] }, { internal: true });
   await service.approveChangeSet("project-1", set.id, { actor_id: "founder-1" });
   await service.applyApprovedChangeSet("project-1", set.id, { actor_id: "founder-1" });
   assert.equal(store.state.versions[0].source_turn_id, "turn-1");
