@@ -65,14 +65,16 @@ async function validateItem(client, projectId, item, expectedTopIssue) {
   if (payload.assumption_id) await owns(client, "assumptions", projectId, payload.assumption_id, "Assumption");
   if (payload.experiment_id) await owns(client, "experiments", projectId, payload.experiment_id, "Experiment");
   if (record_type === "belief") {
-    if (!nonEmpty(payload.statement) || !beliefClassifications.includes(payload.classification)) throw fail("Belief proposals require a valid statement and classification");
+    if (operation === "create" && (!nonEmpty(payload.statement) || !beliefClassifications.includes(payload.classification))) throw fail("New belief proposals require a valid statement and classification");
+    if (payload.statement !== undefined && !nonEmpty(payload.statement)) throw fail("Belief statement must be non-empty");
+    if (payload.classification !== undefined && !beliefClassifications.includes(payload.classification)) throw fail("Belief classification is invalid");
     if (["finding", "evidence_observation"].includes(payload.classification) && (!Array.isArray(payload.evidence_links) || !payload.evidence_links.length)) throw fail("Evidence-free belief upgrades are not allowed");
     for (const link of payload.evidence_links || []) { if (!object(link) || !nonEmpty(link.source_id) || !["supports", "contradicts", "mixed", "neutral"].includes(link.relationship)) throw fail("Invalid belief evidence link"); await owns(client, "evidence", projectId, link.source_id, "Evidence"); }
   }
-  if (record_type === "evidence" && (!nonEmpty(payload.source_type) || !nonEmpty(payload.source_title) || !nonEmpty(payload.summary))) throw fail("Evidence proposals require source_type, source_title, and summary");
-  if (record_type === "task" && !nonEmpty(payload.title)) throw fail("Task proposals require a title");
-  if (record_type === "experiment" && (!nonEmpty(payload.title) || !nonEmpty(payload.hypothesis) || !nonEmpty(payload.success_metric))) throw fail("Experiment proposals require title, hypothesis, and success_metric");
-  if (record_type === "decision" && (!nonEmpty(payload.title) || !nonEmpty(payload.decision))) throw fail("Decision proposals require title and decision");
+  if (operation === "create" && record_type === "evidence" && (!nonEmpty(payload.source_type) || !nonEmpty(payload.source_title) || !nonEmpty(payload.summary))) throw fail("Evidence proposals require source_type, source_title, and summary");
+  if (operation === "create" && record_type === "task" && !nonEmpty(payload.title)) throw fail("Task proposals require a title");
+  if (operation === "create" && record_type === "experiment" && (!nonEmpty(payload.title) || !nonEmpty(payload.hypothesis) || !nonEmpty(payload.success_metric))) throw fail("Experiment proposals require title, hypothesis, and success_metric");
+  if (operation === "create" && record_type === "decision" && (!nonEmpty(payload.title) || !nonEmpty(payload.decision))) throw fail("Decision proposals require title and decision");
   if (["task", "experiment"].includes(record_type) && (payload.top_unresolved_issue_id !== expectedTopIssue?.assumption_id) && !nonEmpty(payload.justification)) throw fail("Tasks and experiments require the current top unresolved issue or a justification");
   return { record_type, operation, target_entity_id: item.target_entity_id || null, payload };
 }
@@ -127,7 +129,24 @@ async function applyItem(client, projectId, item, actor) {
   if (item.operation === "create") { const fields = ["project_id", ...columns], params = [projectId, ...values]; const row = (await client.query(`INSERT INTO ${tableFor[type]} (${fields.join(",")}) VALUES (${fields.map((_, i) => `$${i + 1}`).join(",")}) RETURNING id`, params)).rows[0]; return { entity_id: row.id }; }
   const allowed = columns.filter(column => editable[type].has(column)); if (!allowed.length) throw fail("Update has no writable fields"); const row = (await client.query(`UPDATE ${tableFor[type]} SET ${allowed.map((column, i) => `${column}=$${i + 1}`).join(",")} WHERE id=$${allowed.length + 1} AND project_id=$${allowed.length + 2} RETURNING id`, [...allowed.map(column => payload[column]), item.target_entity_id, projectId])).rows[0]; if (!row) throw fail("Target entity not found during apply"); return { entity_id: row.id };
 }
-async function applyApprovedChangeSet(projectId, changeSetId, context = {}) { const actor = auth(projectId, context); return transaction(async client => { const set = await withSet(client, projectId, changeSetId); if (set.status === "applied") return { ...set, idempotent: true }; if (set.status !== "approved" || (set.expires_at && new Date(set.expires_at) <= new Date())) throw fail("Change set is not approved for application"); const items = (await client.query("SELECT * FROM change_set_items WHERE change_set_id=$1 ORDER BY sequence_number FOR UPDATE", [set.id])).rows.filter(item => item.review_status === "approved"); if (!items.length) throw fail("Change set has no approved items"); await client.query("UPDATE change_sets SET status='applying' WHERE id=$1", [set.id]); for (const item of items) { const result = await applyItem(client, projectId, item, actor); await client.query("UPDATE change_set_items SET review_status='applied',application_result_metadata=$2 WHERE id=$1", [item.id, result]); await audit(client, projectId, actor, "applied", item.record_type, result.entity_id, { change_set_id: set.id, item_id: item.id, operation: item.operation, before: item.operation === "create" ? null : item.original_payload, after: item.current_payload }); }
-    const applied = (await client.query("UPDATE change_sets SET status='applied',applied_at=now(),applied_by=$2,application_metadata=$3 WHERE id=$1 RETURNING *", [set.id, actor, { applied_item_count: items.length }])).rows[0]; await audit(client, projectId, actor, "applied", "change_set", set.id, { item_count: items.length }); return { ...applied, idempotent: false }; }); }
+async function applyApprovedChangeSet(projectId, changeSetId, context = {}) {
+  const actor = auth(projectId, context);
+  try {
+    return await transaction(async client => { const set = await withSet(client, projectId, changeSetId); if (set.status === "applied") return { ...set, idempotent: true }; if (set.status !== "approved" || (set.expires_at && new Date(set.expires_at) <= new Date())) throw fail("Change set is not approved for application"); const items = (await client.query("SELECT * FROM change_set_items WHERE change_set_id=$1 ORDER BY sequence_number FOR UPDATE", [set.id])).rows.filter(item => item.review_status === "approved"); if (!items.length) throw fail("Change set has no approved items"); await client.query("UPDATE change_sets SET status='applying' WHERE id=$1", [set.id]); for (const item of items) { const result = await applyItem(client, projectId, item, actor); await client.query("UPDATE change_set_items SET review_status='applied',application_result_metadata=$2 WHERE id=$1 RETURNING *", [item.id, result]); await audit(client, projectId, actor, "applied", item.record_type, result.entity_id, { change_set_id: set.id, item_id: item.id, operation: item.operation, before: item.operation === "create" ? null : item.original_payload, after: item.current_payload }); }
+      const applied = (await client.query("UPDATE change_sets SET status='applied',applied_at=now(),applied_by=$2,application_metadata=$3 WHERE id=$1 RETURNING *", [set.id, actor, { applied_item_count: items.length }])).rows[0]; await audit(client, projectId, actor, "applied", "change_set", set.id, { item_count: items.length }); return { ...applied, idempotent: false }; });
+  } catch (error) {
+    // The application transaction has rolled back, so no item or entity write
+    // survives. Persist the failure state and its audit event together in a
+    // separate transaction; this deliberately leaves the rollback guarantee
+    // for the attempted application untouched.
+    if (error.code !== "INVALID_CHANGE_SET") {
+      await transaction(async client => {
+        const failed = await client.query("UPDATE change_sets SET status='failed', application_metadata=application_metadata || $2::jsonb WHERE id=$1 AND project_id=$3 AND status IN ('approved','applying') RETURNING *", [changeSetId, JSON.stringify({ error: error.message }), projectId]);
+        if (failed.rowCount) await audit(client, projectId, actor, "failed", "change_set", changeSetId, { error: error.message });
+      });
+    }
+    throw error;
+  }
+}
 
 module.exports = { proposeChangeSet, approveChangeSet, approveChangeSetItems, rejectChangeSet, editChangeSetItem, getPendingChangeSetsForProject, applyApprovedChangeSet, validateItem, MAX_ITEMS, MAX_PAYLOAD_BYTES };
