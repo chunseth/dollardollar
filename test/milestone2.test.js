@@ -102,6 +102,16 @@ if (!process.env.DATABASE_URL) {
     assert.equal((await api(`/api/projects/${created.project.id}`, { method: "DELETE" })).status, 204);
   });
 
+  test("onboarding projects accepted assumptions into initial beliefs", async () => {
+    const draft = { profile: { name: { value: "Belief onboarding", confidence: "high" } }, assumptions: [{ statement: "At least 3 of 10 operators will agree to a paid pilot.", validation_criterion: "At least 3 of 10 operators will agree to a paid pilot.", category: "willingness_to_pay", priority: "high", risk_score: 80, rationale: "Payment validates demand." }], tasks: [] };
+    const created = await json(await api("/api/onboarding/confirm", { method: "POST", body: { draft, accepted: { profile: ["name"], assumptions: ["assumption-1"], tasks: [] } } }));
+    const beliefs = await pool.query("SELECT b.origin_assumption_id, bv.version_number, bv.statement FROM beliefs b JOIN belief_versions bv ON bv.id=b.current_version_id WHERE b.project_id=$1", [created.project.id]);
+    assert.equal(beliefs.rowCount, 1);
+    assert.equal(beliefs.rows[0].version_number, 1);
+    assert.equal(beliefs.rows[0].statement, draft.assumptions[0].statement);
+    assert.equal((await api(`/api/projects/${created.project.id}`, { method: "DELETE" })).status, 204);
+  });
+
   test("post-confirmation plan saves linked milestones, tasks, and experiments", async () => {
     const created = await json(await api("/api/projects", { method: "POST", body: { name: "Planner smoke" } }));
     const projectId = created.project.id;
