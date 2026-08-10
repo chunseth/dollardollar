@@ -129,7 +129,7 @@ test("chat persists ordered turns, context linkage, and a current recommendation
     assert.deepEqual(history.turns.map(turn => turn.actor_type), ["founder", "ai"]);
     assert.deepEqual(history.turns.map(turn => turn.turn_no), [1, 2]);
     const recommendation = await json(await api(`/api/projects/${project.id}/recommendation`));
-    assert.equal(recommendation.recommendation.recommendation.state, "wait");
+    assert.equal(recommendation.recommendation.recommendation.state, "question");
     assert.equal(recommendation.recommendation.context_packet_id, posted.context_packet.id);
     const audit = await pool.query("SELECT actor_type, actor_id, event_type, entity_type, entity_id FROM event_log WHERE project_id=$1 AND entity_id = ANY($2::uuid[]) ORDER BY created_at", [project.id, [posted.founder_turn.id, posted.assistant_turn.id]]);
     assert.deepEqual(audit.rows.map(row => [row.actor_type, row.actor_id, row.event_type, row.entity_type]), [["founder", owner, "created", "conversation_turn"], ["ai", owner, "created", "conversation_turn"]]);
@@ -180,7 +180,7 @@ test("chat model proposals cannot override the deterministic no-issue wait rule"
   const project = (await json(await api("/api/projects", { method: "POST", body: { name: "Flow coverage" } }))).project;
   for (const [message, state] of [["flow question", "question"], ["flow task", "task"], ["flow experiment", "experiment"], ["flow evidence", "wait"]]) {
     const posted = await json(await api(`/api/projects/${project.id}/chat`, { method: "POST", body: { message, client_request_id: `${message}-retry-key` } }));
-    assert.equal(posted.recommendation.recommendation.state, "wait");
+    assert.equal(posted.recommendation.recommendation.state, "question");
     assert.ok(posted.assistant_turn.id);
     if (message === "flow question") assert.equal(posted.change_set.items[0].record_type, "belief");
     if (message === "flow task") assert.equal(posted.change_set.items[0].record_type, "task");

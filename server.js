@@ -6,7 +6,8 @@ const { query, transaction } = require("./db");
 const { createDraft, createPlan, normalizeDraft, fields: onboardingFields, industries, industryModules, revenuePathFields, projectTitle } = require("./onboarding");
 const { buildProjectContext } = require("./context");
 const { synthesizeCheckpoint } = require("./checkpoint_synthesis");
-const { handleFounderMessage, callOpenAIModel } = require("./cofounder");
+const { handleFounderMessage, callOpenAIModel, callFastCofounderModel } = require("./cofounder");
+const { activePlan, pendingPlanItems, listMemoryItems, drainJobs, ensurePlan } = require("./operating_loop");
 const { recalculateRecommendation, recommendationHistory } = require("./recommendations");
 const { createBeliefFromAssumption, appendBeliefVersion, linkEvidenceToBeliefVersion } = require("./beliefs");
 const { proposeChangeSet: defaultProposeChangeSet, approveChangeSet, approveChangeSetItems, rejectChangeSet, editChangeSetItem, getPendingChangeSetsForProject, applyApprovedChangeSet } = require("./change_sets");
@@ -80,10 +81,11 @@ async function fullMemory(projectId, executor = { query }, includeConversation =
   const milestones = await executor.query("SELECT * FROM roadmap_milestones WHERE project_id=$1 ORDER BY position", [projectId]);
   const links = await executor.query("SELECT ae.* FROM assumption_evidence ae JOIN evidence e ON e.id=ae.evidence_id WHERE e.project_id=$1", [projectId]);
   const discoveryFacts = await executor.query("SELECT * FROM discovery_facts WHERE project_id=$1 ORDER BY created_at DESC", [projectId]);
+  const memoryItems = await executor.query("SELECT * FROM memory_items WHERE project_id=$1 AND status='current' ORDER BY created_at DESC", [projectId]).catch(() => ({ rows: [] }));
   const beliefs = await executor.query("SELECT b.id, b.origin_assumption_id, b.current_version_id, b.is_active, bv.version_number, bv.statement, bv.classification, bv.validation_status, bv.confidence, bv.importance, bv.scope, bv.rationale, bv.source_event_id, bv.source_turn_id, bv.source_user_id, bv.source_assumption_id, bv.source_identifier, bv.provenance, bv.created_at AS version_created_at FROM beliefs b JOIN belief_versions bv ON bv.id=b.current_version_id WHERE b.project_id=$1 AND b.is_active=true ORDER BY bv.created_at DESC", [projectId]);
   const beliefEvidenceLinks = await executor.query("SELECT bel.* FROM belief_evidence_links bel JOIN belief_versions bv ON bv.id=bel.belief_version_id JOIN beliefs b ON b.id=bv.belief_id WHERE b.project_id=$1 ORDER BY bel.created_at DESC", [projectId]);
   const events = await executor.query("SELECT * FROM event_log WHERE project_id=$1 ORDER BY created_at DESC LIMIT 50", [projectId]);
-  const memory = { project: project.rows[0], assumptions: assumptions.rows, evidence: evidence.rows, experiments: experiments.rows, tasks: tasks.rows, decisions: decisions.rows, roadmap_milestones: milestones.rows, assumption_evidence: links.rows, beliefs: beliefs.rows, belief_evidence_links: beliefEvidenceLinks.rows, discovery_facts: discoveryFacts.rows, events: events.rows };
+  const memory = { project: project.rows[0], assumptions: assumptions.rows, evidence: evidence.rows, experiments: experiments.rows, tasks: tasks.rows, decisions: decisions.rows, roadmap_milestones: milestones.rows, assumption_evidence: links.rows, beliefs: beliefs.rows, belief_evidence_links: beliefEvidenceLinks.rows, discovery_facts: discoveryFacts.rows, memory_items: memoryItems.rows, events: events.rows };
   if (!includeConversation) return memory;
   const recommendation = await executor.query("SELECT id, context_packet_id, recommendation, created_at FROM recommendations WHERE project_id=$1 AND status='active' ORDER BY created_at DESC, id DESC LIMIT 1", [projectId]);
   const conversationTurns = await executor.query("SELECT id, session_id, turn_no, actor_type, content, created_at FROM conversation_turns WHERE project_id=$1 ORDER BY created_at DESC, turn_no DESC, id DESC LIMIT 20", [projectId]);
@@ -116,12 +118,59 @@ function placeholderAssistant({ contextPacket, founderTurn }) {
     included_memory_record_ids: contextPacket.included_memory_record_ids
   };
 }
-async function chatHistory(projectId) {
-  return (await query("SELECT id, session_id, context_packet_id, turn_no, actor_type, content, model, prompt_version, structured_payload, created_at FROM conversation_turns WHERE project_id=$1 ORDER BY created_at ASC, turn_no ASC", [projectId])).rows;
+async function chatHistory(projectId, sessionId = null) {
+  const params = [projectId];
+  const filter = sessionId ? ` AND session_id=$2` : "";
+  if (sessionId) params.push(sessionId);
+  return (await query(`SELECT id, session_id, context_packet_id, turn_no, actor_type, content, model, prompt_version, structured_payload, created_at FROM conversation_turns WHERE project_id=$1${filter} ORDER BY created_at ASC, turn_no ASC`, params)).rows;
 }
-async function chatDiscovery(projectId) {
+async function chatDiscovery(projectId, sessionId = null) {
   const packet = buildProjectContext(await fullMemory(projectId));
-  return { discovery_plan: packet.data.discovery_plan, discovery_facts: packet.data.discovery_facts || [] };
+  return { discovery_plan: packet.data.discovery_plan, discovery_facts: packet.data.discovery_facts || [], active_plan: await activePlan(projectId), pending_plan_items: await pendingPlanItems(projectId), session_id: sessionId };
+}
+
+async function materializeRoadmapGraph(client, projectId) {
+  const milestones = (await client.query("SELECT * FROM roadmap_milestones WHERE project_id=$1 ORDER BY position", [projectId])).rows;
+  const visible = [...milestones];
+  const fallbackTitles = ["Shape the first paid offer", "Reach the right first customers", "Deliver the smallest useful version", "Collect the first payment"];
+  while (visible.length < 4) {
+    const position = visible.length + 1;
+    visible.push({ id: null, title: fallbackTitles[position - 1], description: "A focused step on the shortest path to first revenue.", success_metric: "Founder confirms the step is complete with evidence.", position, status: "proposed", source: "system", assumption_id: null });
+  }
+  for (const milestone of visible.slice(0, 4)) {
+    await client.query(
+      `INSERT INTO roadmap_nodes (project_id,node_type,entity_id,title,description,status,visible,position,source)
+       VALUES ($1,'milestone',$2,$3,$4,$5,true,$6,$7)
+       ON CONFLICT DO NOTHING`,
+      [projectId, milestone.id, milestone.title, milestone.description, milestone.status === "completed" ? "completed" : "pending", milestone.position, milestone.source || "ai"]
+    );
+  }
+  const records = [
+    ["assumption", "assumptions", "statement", "risk_score"],
+    ["experiment", "experiments", "title", "created_at"],
+    ["task", "tasks", "title", "created_at"]
+  ];
+  for (const [nodeType, table, titleField] of records) {
+    const rows = (await client.query(`SELECT * FROM ${table} WHERE project_id=$1`, [projectId])).rows;
+    for (const row of rows) {
+      await client.query(
+        `INSERT INTO roadmap_nodes (project_id,node_type,entity_id,title,description,status,visible,source,metadata)
+         VALUES ($1,$2,$3,$4,$5,$6,false,'ai',$7)
+         ON CONFLICT DO NOTHING`,
+        [projectId, nodeType, row.id, row[titleField], row.description || row.statement || row.hypothesis || "", row.status === "done" || row.status === "completed" ? "completed" : row.status === "blocked" ? "blocked" : "pending", { assumption_id: row.assumption_id || null, experiment_id: row.experiment_id || null }]
+      );
+    }
+  }
+  const nodes = (await client.query("SELECT * FROM roadmap_nodes WHERE project_id=$1", [projectId])).rows;
+  const milestonesByAssumption = new Map(visible.filter(row => row.assumption_id).map(row => [String(row.assumption_id), row]));
+  for (const node of nodes.filter(row => ["assumption", "experiment", "task"].includes(row.node_type))) {
+    const assumptionId = node.metadata?.assumption_id || (node.node_type === "assumption" ? node.entity_id : null);
+    const milestone = milestonesByAssumption.get(String(assumptionId));
+    if (!milestone) continue;
+    const milestoneNode = nodes.find(item => item.node_type === "milestone" && String(item.entity_id) === String(milestone.id));
+    if (milestoneNode) await client.query("INSERT INTO roadmap_edges (project_id,from_node_id,to_node_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", [projectId, node.id, milestoneNode.id]);
+  }
+  return { nodes: (await client.query("SELECT * FROM roadmap_nodes WHERE project_id=$1 ORDER BY visible DESC, position NULLS LAST", [projectId])).rows, edges: (await client.query("SELECT * FROM roadmap_edges WHERE project_id=$1", [projectId])).rows };
 }
 
 async function api(request, response, url, generatePlan = createPlan, generateAssistant = callOpenAIModel, proposeCofounderChangeSet = defaultProposeChangeSet) {
@@ -188,7 +237,14 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
     }
     return fail(response, 404, "Change-set route not found");
   }
-  if (parts[3] === "chat" && parts.length === 4 && method === "GET") return send(response, 200, { turns: await chatHistory(projectId), ...(await chatDiscovery(projectId)) });
+  if (parts[3] === "sessions" && parts.length === 4 && method === "GET") return send(response, 200, { sessions: (await query("SELECT * FROM conversation_sessions WHERE project_id=$1 ORDER BY created_at DESC", [projectId])).rows });
+  if (parts[3] === "sessions" && parts.length === 4 && method === "POST") {
+    const body = await readBody(request), topic = typeof body.topic === "string" && body.topic.trim() ? body.topic.trim().slice(0, 80) : "general";
+    const title = typeof body.title === "string" && body.title.trim() ? body.title.trim().slice(0, 160) : topic;
+    const session = (await query("INSERT INTO conversation_sessions (project_id,initiated_by,topic,title,metadata) VALUES ($1,'founder',$2,$3,$4) RETURNING *", [projectId, topic, title, body.metadata && typeof body.metadata === "object" ? body.metadata : {}])).rows[0];
+    return send(response, 201, { session });
+  }
+  if (parts[3] === "chat" && parts.length === 4 && method === "GET") { const sessionId = url.searchParams.get("session_id") || null; return send(response, 200, { turns: await chatHistory(projectId, sessionId), ...(await chatDiscovery(projectId, sessionId)) }); }
   if (parts[3] === "checkpoint" && parts[4] === "synthesis" && parts.length === 5 && method === "GET") {
     const memory = await fullMemory(projectId);
     const synthesis = synthesizeCheckpoint(memory);
@@ -211,7 +267,7 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
       const alreadyConfirmed = current.onboarding_state === "active" && (await client.query("SELECT 1 FROM event_log WHERE project_id=$1 AND entity_type='project_checkpoint' AND event_type='confirmed' LIMIT 1", [projectId])).rowCount;
       if (alreadyConfirmed) return current;
       const entries = Object.entries(values);
-      const result = await client.query(`UPDATE projects SET ${entries.map(([key], index) => `${key}=$${index + 1}`).join(",")}, onboarding_state='active' WHERE id=$${entries.length + 1} RETURNING *`, [...entries.map(([, value]) => value), projectId]);
+      const result = await client.query(`UPDATE projects SET ${entries.map(([key], index) => `${key}=$${index + 1}`).join(",")}, onboarding_state='active', checkpoint_status='confirmed', checkpoint_metadata=$${entries.length + 2} WHERE id=$${entries.length + 1} RETURNING *`, [...entries.map(([, value]) => value), projectId, { confirmed_at: new Date().toISOString(), source_discovery_facts: true }]);
       const sourceFacts = (await client.query("SELECT id, field_key, statement, classification, confidence, source_turn_id FROM discovery_facts WHERE project_id=$1 AND status='current' ORDER BY created_at", [projectId])).rows;
       await log(client, projectId, "founder", "confirmed", "project_checkpoint", projectId, "Confirmed the first company snapshot", { onboarding_state: "active", profile: values, source_discovery_facts: sourceFacts });
       return result.rows[0];
@@ -219,7 +275,6 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
     return send(response, 200, { project: row });
   }
   if (parts[3] === "recommendation" && parts.length === 4 && method === "GET") {
-    if (existingProject.onboarding_state === "discovery") return send(response, 200, { recommendation: null });
     const recommendation = (await query("SELECT id, context_packet_id, recommendation, primary_issue_id, primary_issue_text, state, source_context, version, supersedes_id, created_at FROM recommendations WHERE project_id=$1 AND status='active' ORDER BY version DESC, created_at DESC LIMIT 1", [projectId])).rows[0];
     return send(response, 200, { recommendation: recommendation || null });
   }
@@ -228,8 +283,15 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
     const body = await readBody(request);
     if (typeof body.message !== "string" || !body.message.trim()) return fail(response, 422, "Chat message is required");
     if (body.message.length > 20_000) return fail(response, 422, "Chat message must be 20,000 characters or fewer");
-    const result = await handleFounderMessage(projectId, owner, body.message, { callCofounderModel: generateAssistant, proposeChangeSet: proposeCofounderChangeSet, client_request_id: body.client_request_id || body.clientRequestId });
+    const result = await handleFounderMessage(projectId, owner, body.message, { callFastCofounderModel: generateAssistant, inlineExtraction: generateAssistant !== callFastCofounderModel, topic: body.topic || "general", sessionId: body.session_id || body.sessionId || null, proposeChangeSet: proposeCofounderChangeSet, client_request_id: body.client_request_id || body.clientRequestId });
     return send(response, 201, result);
+  }
+  if (parts[3] === "recommendation-queue" && parts.length === 4 && method === "GET") return send(response, 200, { plan: await activePlan(projectId), items: await pendingPlanItems(projectId) });
+  if (parts[3] === "memory-items" && parts.length === 4 && method === "GET") return send(response, 200, { memory_items: await listMemoryItems(projectId, { aspect: url.searchParams.get("aspect"), confidence: url.searchParams.get("confidence") }) });
+  if (parts[3] === "roadmap-graph" && parts.length === 4 && method === "GET") return send(response, 200, { nodes: (await query("SELECT * FROM roadmap_nodes WHERE project_id=$1 ORDER BY visible DESC, position NULLS LAST, created_at", [projectId])).rows, edges: (await query("SELECT * FROM roadmap_edges WHERE project_id=$1", [projectId])).rows });
+  if (parts[3] === "checkpoint" && parts[4] === "naming" && parts.length === 5 && method === "GET") {
+    const synthesis = synthesizeCheckpoint(await fullMemory(projectId));
+    return send(response, 200, { ready: synthesis.readiness, suggestion: synthesis.company_name_suggestion, naming_directions: synthesis.company_name_suggestion ? [synthesis.company_name_suggestion.value, `${synthesis.company_name_suggestion.value} Labs`, `${synthesis.company_name_suggestion.value} Works`] : [] });
   }
   if (parts[3] === "memory" && method === "GET") return send(response, 200, await fullMemory(projectId));
   if (parts[3] === "plan" && method === "POST") {
@@ -243,6 +305,7 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
       for (const item of plan.roadmap_milestones) { const assumptionId = assumptions[item.assumption_index - 1].id; const row = (await client.query("INSERT INTO roadmap_milestones (project_id,assumption_id,title,description,success_metric,position,source) VALUES ($1,$2,$3,$4,$5,$6,'ai') RETURNING id", [projectId, assumptionId, item.title, item.description, item.success_metric, item.position])).rows[0]; created.milestones++; await log(client, projectId, "ai", "generated", "roadmap_milestone", row.id, `Generated first-dollar milestone: ${item.title}`, item); }
       for (const item of plan.tasks) { const assumptionId = assumptions[item.assumption_index - 1].id; const details = [`Target: ${item.target_segment}`, `Quantity: ${item.target_quantity}`, `Deadline: ${item.deadline}`, `Success metric: ${item.success_metric}`, `Next step: ${item.next_step}`, `Why now: ${item.rationale}`].join("\n\n"); const row = (await client.query("INSERT INTO tasks (project_id,assumption_id,title,description,priority,estimated_minutes,impact_level,source) VALUES ($1,$2,$3,$4,$5,$6,'first_revenue','ai') RETURNING id", [projectId, assumptionId, item.title, `${item.description}\n\n${details}`, item.priority, item.estimated_minutes])).rows[0]; created.tasks++; await log(client, projectId, "ai", "generated", "task", row.id, `Generated validation task: ${item.title}`, item); }
       await log(client, projectId, "ai", "generated", "validation_plan", null, "Generated post-confirmation validation plan", created);
+      await materializeRoadmapGraph(client, projectId);
       return created;
     });
     return send(response, 201, { plan: result });
@@ -264,7 +327,7 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
   return false;
 }
 
-function createServer({ generatePlan = createPlan, generateAssistant = callOpenAIModel, proposeChangeSet = defaultProposeChangeSet } = {}) {
+function createServer({ generatePlan = createPlan, generateAssistant = callFastCofounderModel, proposeChangeSet = defaultProposeChangeSet } = {}) {
 const server = http.createServer(async (request, response) => {
   try {
     const url = new URL(request.url, `http://${request.headers.host}`);
@@ -287,6 +350,11 @@ function startupGuard() {
   if (!/^postgres(ql)?:\/\//i.test(process.env.DATABASE_URL)) throw new Error("Startup blocked: DATABASE_URL must be a Postgres connection string.");
 }
 
-if (require.main === module) { startupGuard(); createServer().listen(port, () => console.log(`First Dollar is running at http://localhost:${port}`)); }
+if (require.main === module) {
+  startupGuard();
+  createServer().listen(port, () => console.log(`First Dollar is running at http://localhost:${port}`));
+  const worker = setInterval(() => drainJobs().catch(error => console.error("Background cofounder worker failed", error)), 750);
+  worker.unref();
+}
 
 module.exports = { createServer, startupGuard, placeholderAssistant, validateAssistantPayload, memoryRecordIds, fullMemory, synthesizeCheckpoint };

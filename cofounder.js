@@ -9,12 +9,31 @@ const { persistRecommendation } = require("./recommendations");
 const { validateCofounderOutput, validateDeterministicRecommendationContext, cofounderOutputSchema } = require("./ai_cofounder_contract");
 const { proposeChangeSet } = require("./change_sets");
 const { discoveryPlan } = require("./discovery_planner");
+const { buildPlanItems, extractWorkingItems } = require("./cofounder_planner");
+const { activePlan, enqueueJob, markPlanItems, replacePlan, saveMemoryItems } = require("./operating_loop");
 
 const OPENAI_URL = "https://api.openai.com/v1/responses";
 const promptVersion = "phase-6-openai-v1";
 const model = process.env.COFOUNDER_MODEL || process.env.OPENAI_MODEL || "gpt-5.5";
 const timeoutMs = Number(process.env.COFOUNDER_TIMEOUT_MS) || 90_000;
 const safeMessage = "I saved your message, but I could not produce a validated cofounder response. Please try again.";
+
+const fastCofounderInstructions = `You are the same warm AI cofounder, responding in real time. Be genuinely interested in the founder's specific idea. Reflect one compelling detail before moving the conversation forward. Ask at most one focused question. Sound like an excited, perceptive collaborator, never an investor interview or a business intake form.
+
+Use only the supplied context. Do not invent facts, evidence, prices, or outcomes. If the founder already answered a planned question, acknowledge it and move to the next useful thread. You may skip a planned question when the founder's message clearly covers it. Keep the reply to one or two short sentences and no more than 55 words. Do not use labels, bullets, colons, or em dashes. If a naming checkpoint is ready, make it feel like a natural identity moment and invite brainstorming.
+
+Return only the supplied JSON schema. Include the IDs of any plan items you consumed or skipped. Choose one hidden cofounder mode from explorer, synthesizer, constructive_challenger, evidence_interpreter, product_design_partner, execution_coach, or roadmap_planner.`;
+
+const fastCofounderSchema = {
+  type: "object", additionalProperties: false,
+  required: ["assistant_message", "consumed_plan_item_ids", "skipped_plan_item_ids", "mode"],
+  properties: {
+    assistant_message: { type: "string" },
+    consumed_plan_item_ids: { type: "array", items: { type: "string" } },
+    skipped_plan_item_ids: { type: "array", items: { type: "string" } },
+    mode: { type: "string", enum: ["explorer", "synthesizer", "constructive_challenger", "evidence_interpreter", "product_design_partner", "execution_coach", "roadmap_planner"] }
+  }
+};
 
 const cofounderInstructions = `You are an AI cofounder helping a founder reach first revenue. Speak like a thoughtful, friendly mentor—not a generic chatbot or an analyst writing a report.
 
@@ -31,7 +50,7 @@ function responseText(result) {
   return result?.output?.flatMap(item => item.content || []).find(item => item.type === "output_text")?.text || "";
 }
 
-async function callOpenAIModel({ contextPacket, founderTurn }) {
+async function callOpenAIModel({ contextPacket, founderTurn, fast = false }) {
   if (!process.env.OPENAI_API_KEY) throw Object.assign(new Error("OPENAI_API_KEY is not configured."), { status: 503 });
   const requestId = `cofounder-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
   const controller = new AbortController();
@@ -44,14 +63,14 @@ async function callOpenAIModel({ contextPacket, founderTurn }) {
       body: JSON.stringify({
         model,
         store: false,
-        max_output_tokens: 2_000,
+        max_output_tokens: fast ? 700 : 2_000,
         // The contract deliberately permits extensible action and record
         // payloads. Keep the schema response-formatted, then enforce the
         // complete contract with validateCofounderOutput below.
-        text: { verbosity: "low", format: { type: "json_schema", name: "cofounder_output", strict: false, schema: cofounderOutputSchema } },
+        text: { verbosity: "low", format: { type: "json_schema", name: fast ? "cofounder_fast_response" : "cofounder_output", strict: false, schema: fast ? fastCofounderSchema : cofounderOutputSchema } },
         input: [
-          { role: "system", content: [{ type: "input_text", text: cofounderInstructions }] },
-          { role: "user", content: [{ type: "input_text", text: JSON.stringify({ context_packet_id: contextPacket.id, founder_turn_id: founderTurn.id, context: contextPacket.data, founder_message: founderTurn.content }) }] }
+          { role: "system", content: [{ type: "input_text", text: fast ? fastCofounderInstructions : cofounderInstructions }] },
+          { role: "user", content: [{ type: "input_text", text: JSON.stringify({ context_packet_id: contextPacket.id, founder_turn_id: founderTurn.id, context: contextPacket.data, response_plan: contextPacket.data.response_plan || [], founder_message: founderTurn.content }) }] }
         ]
       })
     });
@@ -69,6 +88,24 @@ async function callOpenAIModel({ contextPacket, founderTurn }) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function callFastCofounderModel({ contextPacket, founderTurn }) {
+  if (!process.env.OPENAI_API_KEY) return callCofounderModel({ contextPacket, founderTurn });
+  const raw = await callOpenAIModel({ contextPacket, founderTurn, fast: true });
+  const deterministic = contextPacket.data?.deterministic_recommendation || {
+    state: "question", primary_issue: "The next useful detail is still taking shape.",
+    reason: "Stay curious about the founder's latest detail.", action_payload: {}, confidence: 1, source_ids: [], rule: "discovery_question"
+  };
+  return {
+    assistant_message: raw.assistant_message,
+    consumed_plan_item_ids: raw.consumed_plan_item_ids || [],
+    skipped_plan_item_ids: raw.skipped_plan_item_ids || [],
+    mode: raw.mode || "explorer",
+    discovery_facts: [], proposed_belief_updates: [], proposed_records: [],
+    recommendation: deterministic, needs_founder_review: false,
+    model: raw.model || model, prompt_version: "cofounder-fast-v1"
+  };
 }
 
 // This is intentionally local and deterministic.  A caller must inject a
@@ -96,8 +133,9 @@ async function fullMemory(projectId, executor) {
   const links = await run("SELECT ae.* FROM assumption_evidence ae JOIN evidence e ON e.id=ae.evidence_id WHERE e.project_id=$1", [projectId]);
   const discoveryFacts = await run("SELECT * FROM discovery_facts WHERE project_id=$1 AND status='current' ORDER BY created_at DESC", [projectId]);
   const recommendation = await run("SELECT id, context_packet_id, recommendation, created_at FROM recommendations WHERE project_id=$1 AND status='active' ORDER BY created_at DESC, id DESC LIMIT 1", [projectId]);
+  const memoryItems = await run("SELECT * FROM memory_items WHERE project_id=$1 AND status='current' ORDER BY created_at DESC", [projectId]).catch(() => ({ rows: [] }));
   const turns = await run("SELECT id, session_id, turn_no, actor_type, content, created_at FROM conversation_turns WHERE project_id=$1 ORDER BY created_at DESC, turn_no DESC, id DESC LIMIT 20", [projectId]);
-  return { project: project.rows[0], assumptions: assumptions.rows, evidence: evidence.rows, experiments: experiments.rows, tasks: tasks.rows, decisions: decisions.rows, assumption_evidence: links.rows, discovery_facts: discoveryFacts.rows, latest_recommendation: recommendation.rows[0] || null, conversation_turns: turns.rows };
+  return { project: project.rows[0], assumptions: assumptions.rows, evidence: evidence.rows, experiments: experiments.rows, tasks: tasks.rows, decisions: decisions.rows, assumption_evidence: links.rows, discovery_facts: discoveryFacts.rows, memory_items: memoryItems.rows, latest_recommendation: recommendation.rows[0] || null, conversation_turns: turns.rows };
 }
 
 function modelError(code, error) {
@@ -128,6 +166,9 @@ function normalizeCofounderOutput(raw, contextPacket, founderTurn, plan = null) 
     }),
     proposed_records: output.proposed_records,
     recommendation: output.recommendation,
+    consumed_plan_item_ids: output.consumed_plan_item_ids || [],
+    skipped_plan_item_ids: output.skipped_plan_item_ids || [],
+    mode: output.mode || null,
     needs_founder_review: typeof output.needs_founder_review === "boolean" ? output.needs_founder_review : Boolean((output.proposed_belief_updates || []).length || (output.proposed_records || []).length),
     model: typeof output.model === "string" && output.model ? output.model : "injected-cofounder",
     prompt_version: typeof output.prompt_version === "string" && output.prompt_version ? output.prompt_version : promptVersion
@@ -161,16 +202,24 @@ function normalizeCofounderOutput(raw, contextPacket, founderTurn, plan = null) 
   return normalized;
 }
 
-async function persistConversationTurn(projectId, message, userId = null) {
+async function persistConversationTurn(projectId, message, userId = null, { topic = "general", sessionId = null } = {}) {
   return transaction(async client => {
-    let session = (await client.query("SELECT id FROM conversation_sessions WHERE project_id=$1 AND status='open' ORDER BY created_at DESC LIMIT 1 FOR UPDATE", [projectId])).rows[0];
-    if (!session) session = (await client.query("INSERT INTO conversation_sessions (project_id,initiated_by) VALUES ($1,'founder') RETURNING id", [projectId])).rows[0];
+    let session = sessionId
+      ? (await client.query("SELECT * FROM conversation_sessions WHERE id=$1 AND project_id=$2 AND status='open' FOR UPDATE", [sessionId, projectId])).rows[0]
+      : (await client.query("SELECT * FROM conversation_sessions WHERE project_id=$1 AND topic=$2 AND status='open' ORDER BY created_at DESC LIMIT 1 FOR UPDATE", [projectId, topic])).rows[0];
+    if (!session) session = (await client.query("INSERT INTO conversation_sessions (project_id,initiated_by,topic,title) VALUES ($1,'founder',$2,$3) RETURNING *", [projectId, topic, topic === "general" ? "Cofounder" : topic])).rows[0];
+    let responsePlan = await activePlan(projectId, client);
+    if (!responsePlan) {
+      const memory = await fullMemory(projectId, client);
+      responsePlan = await replacePlan(client, projectId, session.id, memory, { message, sourceIds: [] });
+    }
     const packet = buildContextPacket(await fullMemory(projectId, client));
-    const contextPacket = (await client.query("INSERT INTO context_packets (project_id,purpose,data,included_memory_record_ids) VALUES ($1,'chat_turn',$2,$3) RETURNING *", [projectId, packet.data, packet.included_memory_record_ids])).rows[0];
+    const packetData = { ...packet.data, response_plan: (responsePlan.items || []).filter(item => item.status === "pending").slice(0, 5), cofounder_mode: responsePlan.mode };
+    const contextPacket = (await client.query("INSERT INTO context_packets (project_id,purpose,data,included_memory_record_ids) VALUES ($1,'chat_turn',$2,$3) RETURNING *", [projectId, packetData, packet.included_memory_record_ids])).rows[0];
     const turnNo = (await client.query("SELECT COALESCE(MAX(turn_no),0)+1 AS turn_no FROM conversation_turns WHERE session_id=$1", [session.id])).rows[0].turn_no;
     const founderTurn = (await client.query("INSERT INTO conversation_turns (session_id,project_id,context_packet_id,turn_no,actor_type,content) VALUES ($1,$2,$3,$4,'founder',$5) RETURNING *", [session.id, projectId, contextPacket.id, turnNo, message])).rows[0];
     await client.query("INSERT INTO event_log (project_id,actor_type,actor_id,event_type,entity_type,entity_id,summary,payload) VALUES ($1,'founder',$2,'created','conversation_turn',$3,$4,$5)", [projectId, userId, founderTurn.id, "Saved founder chat turn", { context_packet_id: contextPacket.id, turn_no: founderTurn.turn_no }]);
-    return { contextPacket, founderTurn, sessionId: session.id, nextTurn: Number(turnNo) + 1 };
+    return { contextPacket, founderTurn, sessionId: session.id, nextTurn: Number(turnNo) + 1, responsePlan };
   });
 }
 
@@ -208,16 +257,17 @@ function idempotencyKey(projectId, output, contextPacket, founderTurn, retryKey 
 async function persistAssistantResponse(projectId, saved, output, userId, plan) {
   return transaction(async client => {
     const assistantTurn = (await client.query("INSERT INTO conversation_turns (session_id,project_id,context_packet_id,turn_no,actor_type,content,model,prompt_version,structured_payload) VALUES ($1,$2,$3,$4,'ai',$5,$6,$7,$8) RETURNING *", [saved.sessionId, projectId, saved.contextPacket.id, saved.nextTurn, output.assistant_message, output.model, output.prompt_version, output])).rows[0];
-    if (saved.contextPacket.data.project_snapshot?.onboarding_state === "discovery") await persistDiscoveryFacts(client, projectId, output.discovery_facts, saved.founderTurn.id);
+    await markPlanItems(client, output.consumed_plan_item_ids, "consumed", assistantTurn.id);
+    await markPlanItems(client, output.skipped_plan_item_ids, "skipped", assistantTurn.id);
     await client.query("INSERT INTO event_log (project_id,actor_type,actor_id,event_type,entity_type,entity_id,summary,payload) VALUES ($1,'ai',$2,'created','conversation_turn',$3,$4,$5)", [projectId, userId, assistantTurn.id, "Saved AI chat turn", { context_packet_id: saved.contextPacket.id, turn_no: assistantTurn.turn_no, model: output.model, prompt_version: output.prompt_version }]);
-    const recommendation = saved.contextPacket.data.project_snapshot?.onboarding_state === "discovery" ? null : await persistRecommendation(client, projectId, saved.contextPacket, plan, output.recommendation);
-    return { assistantTurn, recommendation };
+    const recommendation = await persistRecommendation(client, projectId, saved.contextPacket, plan, output.recommendation);
+    return { assistantTurn, recommendation, plan: saved.responsePlan };
   });
 }
 
 async function handleFounderMessage(projectId, userId, message, options = {}) {
   if (typeof message !== "string" || !message.trim()) throw Object.assign(new Error("Chat message is required"), { status: 422 });
-  const saved = await persistConversationTurn(projectId, message.trim(), userId);
+  const saved = await persistConversationTurn(projectId, message.trim(), userId, { topic: options.topic || "general", sessionId: options.sessionId || null });
   // The full ranking is persisted in the context packet, and its deterministic
   // result is the canonical recommendation source for this chat turn.
   const plan = {
@@ -227,7 +277,7 @@ async function handleFounderMessage(projectId, userId, message, options = {}) {
   };
   let raw, fallbackError = null;
   try {
-    raw = await (options.callCofounderModel || callCofounderModel)({ projectId, userId, message: saved.founderTurn.content, contextPacket: saved.contextPacket, founderTurn: saved.founderTurn });
+    raw = await (options.callFastCofounderModel || options.callCofounderModel || callFastCofounderModel)({ projectId, userId, message: saved.founderTurn.content, contextPacket: saved.contextPacket, founderTurn: saved.founderTurn });
   } catch (error) {
     fallbackError = modelError("model_failure", error);
     raw = { assistant_message: safeMessage, proposed_belief_updates: [], proposed_records: [], recommendation: saved.contextPacket.data.deterministic_recommendation, needs_founder_review: false, model: "deterministic-fallback", prompt_version: promptVersion };
@@ -242,30 +292,100 @@ async function handleFounderMessage(projectId, userId, message, options = {}) {
   }
   output = output || normalizeCofounderOutput(raw, saved.contextPacket, saved.founderTurn, plan);
   const persisted = await persistAssistantResponse(projectId, saved, output, userId, plan);
-  const result = { founder_turn: saved.founderTurn, assistant_turn: persisted.assistantTurn, context_packet: saved.contextPacket, recommendation: persisted.recommendation, ...(fallbackError ? { error: fallbackError } : {}) };
-  // A recommendation is persisted as conversation state; only proposed memory
-  // updates cross the Phase 5 review boundary.
-  const isDiscovery = saved.contextPacket.data.project_snapshot?.onboarding_state === "discovery";
-  const hasMaterialProposal = !isDiscovery && (output.proposed_belief_updates.length || output.proposed_records.length);
-  if (!hasMaterialProposal) return result;
+  const result = {
+    founder_turn: saved.founderTurn,
+    assistant_turn: persisted.assistantTurn,
+    context_packet: saved.contextPacket,
+    recommendation: persisted.recommendation,
+    response_plan: saved.responsePlan,
+    consumed_plan_item_ids: output.consumed_plan_item_ids || [],
+    skipped_plan_item_ids: output.skipped_plan_item_ids || [],
+    processing: { status: "queued", job_type: "turn_enrichment" },
+    ...(fallbackError ? { error: fallbackError } : {})
+  };
+
+  const extractionKey = options.idempotencyKey || options.idempotency_key || options.clientRequestId || options.client_request_id || saved.founderTurn.id;
   try {
-    // The no-unresolved-issue wait state has no source record by design. The
-    // persisted recommendation keeps source_ids empty, while the material
-    // proposal envelope still needs chat provenance for its own validation.
-    const proposalOutput = output.recommendation.source_ids.length ? output : {
-      ...output,
-      recommendation: { ...output.recommendation, source_ids: [saved.contextPacket.id, persisted.assistantTurn.id] }
-    };
-    result.change_set = await (options.proposeChangeSet || proposeChangeSet)(projectId, proposalOutput, {
-      source_turn_id: persisted.assistantTurn.id,
-      idempotency_key: idempotencyKey(projectId, output, saved.contextPacket, saved.founderTurn, options.idempotencyKey || options.idempotency_key || options.clientRequestId || options.client_request_id),
-      include_recommendation: false,
-      proposal_metadata: { phase: 6, source_turn_id: persisted.assistantTurn.id, context_packet_id: saved.contextPacket.id, provenance: { founder_turn_id: saved.founderTurn.id, assistant_turn_id: persisted.assistantTurn.id } }
-    });
+    await enqueueJob(projectId, "turn_enrichment", {
+      project_id: projectId,
+      user_id: userId,
+      founder_turn_id: saved.founderTurn.id,
+      assistant_turn_id: persisted.assistantTurn.id,
+      context_packet_id: saved.contextPacket.id,
+      session_id: saved.sessionId,
+      message: saved.founderTurn.content
+    }, extractionKey);
   } catch (error) {
-    result.proposal_error = { code: error.code || "CHANGE_SET_VALIDATION_FAILED", message: "The response was saved, but its proposed updates need correction before review.", detail: error.message };
+    result.processing = { status: "unavailable", error: error.message };
+  }
+
+  // Preserve the old injected-model contract for tests and local callers that
+  // explicitly opt into synchronous proposals. Production uses the queue.
+  if (options.inlineExtraction) {
+    const isDiscovery = saved.contextPacket.data.project_snapshot?.onboarding_state === "discovery";
+    const hasMaterialProposal = (!isDiscovery || options.inlineExtraction) && (output.proposed_belief_updates.length || output.proposed_records.length);
+    if (hasMaterialProposal) {
+      try {
+        const proposalOutput = output.recommendation.source_ids.length ? output : { ...output, recommendation: { ...output.recommendation, source_ids: [saved.contextPacket.id, persisted.assistantTurn.id] } };
+        result.change_set = await (options.proposeChangeSet || proposeChangeSet)(projectId, proposalOutput, {
+          source_turn_id: persisted.assistantTurn.id,
+          idempotency_key: idempotencyKey(projectId, output, saved.contextPacket, saved.founderTurn, extractionKey),
+          include_recommendation: false,
+          proposal_metadata: { phase: 6, source_turn_id: persisted.assistantTurn.id, context_packet_id: saved.contextPacket.id, provenance: { founder_turn_id: saved.founderTurn.id, assistant_turn_id: persisted.assistantTurn.id } }
+        });
+      } catch (error) {
+        result.proposal_error = { code: error.code || "CHANGE_SET_VALIDATION_FAILED", message: "The response was saved, but its proposed updates need correction before review.", detail: error.message };
+      }
+    }
   }
   return result;
 }
 
-module.exports = { handleFounderMessage, callCofounderModel, callOpenAIModel, normalizeCofounderOutput, persistConversationTurn, idempotencyKey, fullMemory };
+async function handleEnrichmentJob(payload, { extractor = callOpenAIModel, proposer = proposeChangeSet } = {}) {
+  const packetResult = await query("SELECT * FROM context_packets WHERE id=$1 AND project_id=$2", [payload.context_packet_id, payload.project_id]);
+  const founderResult = await query("SELECT * FROM conversation_turns WHERE id=$1 AND project_id=$2 AND actor_type='founder'", [payload.founder_turn_id, payload.project_id]);
+  if (!packetResult.rows[0] || !founderResult.rows[0]) throw new Error("Enrichment source conversation was not found.");
+  const contextPacket = packetResult.rows[0];
+  const founderTurn = founderResult.rows[0];
+  let raw = await extractor({ projectId: payload.project_id, userId: payload.user_id, message: payload.message, contextPacket, founderTurn });
+  const plan = { recommendation: { ...contextPacket.data.deterministic_recommendation, issue: contextPacket.data.top_unresolved_issue || null }, ranked_issues: contextPacket.data.ranked_unresolved_issues || [], selected_issue: contextPacket.data.top_unresolved_issue || null };
+  const output = normalizeCofounderOutput(raw, contextPacket, founderTurn, plan);
+  await transaction(async client => {
+    const memory = await fullMemory(payload.project_id, client);
+    if (memory.project?.onboarding_state === "discovery") {
+      await persistDiscoveryFacts(client, payload.project_id, output.discovery_facts, founderTurn.id);
+      await saveMemoryItems(client, extractWorkingItems({ facts: output.discovery_facts, sourceTurnId: founderTurn.id, projectId: payload.project_id }));
+    }
+    const completedTask = payload.message.match(/I completed this task:\s*([^.!?]+)[.!?]?/i);
+    if (completedTask) {
+      const task = (await client.query("SELECT id FROM tasks WHERE project_id=$1 AND lower(title)=lower($2) LIMIT 1", [payload.project_id, completedTask[1].trim()])).rows[0];
+      if (task) {
+        await client.query("UPDATE tasks SET status='done' WHERE id=$1", [task.id]);
+        await client.query("INSERT INTO event_log (project_id,actor_type,actor_id,event_type,entity_type,entity_id,summary,payload) VALUES ($1,'ai',$2,'completed','task',$3,$4,$5)", [payload.project_id, payload.user_id, task.id, "Marked task complete from founder's chat report", { source_turn_id: founderTurn.id }]);
+      }
+    }
+    const completedExperiment = payload.message.match(/I recorded an experiment result:\s*([^.!?]+)[.!?]?/i);
+    if (completedExperiment) {
+      const experiment = (await client.query("SELECT id FROM experiments WHERE project_id=$1 AND lower(title)=lower($2) LIMIT 1", [payload.project_id, completedExperiment[1].trim()])).rows[0];
+      if (experiment) await client.query("UPDATE experiments SET status='completed', completed_at=now() WHERE id=$1", [experiment.id]);
+    }
+    const latestMemory = await fullMemory(payload.project_id, client);
+    const readiness = discoveryPlan(latestMemory).checkpoint_ready;
+    await client.query("UPDATE projects SET checkpoint_status=$2, checkpoint_metadata=$3 WHERE id=$1", [payload.project_id, readiness ? "ready" : "not_ready", { readiness, source_turn_id: founderTurn.id }]);
+    await client.query("UPDATE conversation_turns SET structured_payload=structured_payload || $2::jsonb WHERE id=$1", [payload.assistant_turn_id, JSON.stringify({ enrichment: output, enriched_at: new Date().toISOString() })]);
+    await replacePlan(client, payload.project_id, payload.session_id, latestMemory, { sourceTurnId: founderTurn.id, sourceIds: [contextPacket.id, founderTurn.id], message: payload.message });
+  });
+  const isDiscovery = contextPacket.data.project_snapshot?.onboarding_state === "discovery";
+  if (!isDiscovery && (output.proposed_belief_updates.length || output.proposed_records.length)) {
+    const proposalOutput = output.recommendation.source_ids.length ? output : { ...output, recommendation: { ...output.recommendation, source_ids: [contextPacket.id, payload.assistant_turn_id] } };
+    await proposer(payload.project_id, proposalOutput, {
+      source_turn_id: payload.assistant_turn_id,
+      idempotency_key: `enrichment:${payload.founder_turn_id}`,
+      include_recommendation: false,
+      proposal_metadata: { phase: 6, enrichment: true, context_packet_id: contextPacket.id, provenance: { founder_turn_id: founderTurn.id, assistant_turn_id: payload.assistant_turn_id } }
+    });
+  }
+  return output;
+}
+
+module.exports = { handleFounderMessage, handleEnrichmentJob, callCofounderModel, callFastCofounderModel, callOpenAIModel, normalizeCofounderOutput, persistConversationTurn, idempotencyKey, fullMemory, persistDiscoveryFacts };
