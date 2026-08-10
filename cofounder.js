@@ -112,8 +112,12 @@ async function callFastCofounderModel({ contextPacket, founderTurn }) {
 // model seam to get a substantive response; Phase 6 never makes a live call.
 async function callCofounderModel({ contextPacket, founderTurn }) {
   const recommendation = contextPacket.data?.deterministic_recommendation || { state: "question", primary_issue: "The next validation detail is unclear", reason: "A specific result or blocker is needed to choose the next action.", action_payload: {}, confidence: 1, source_ids: [] };
+  const planned = contextPacket.data?.response_plan?.[0] || null;
   return {
-    assistant_message: `I saved your update. ${recommendation.reason}`,
+    assistant_message: planned?.prompt || `I saved your update. ${recommendation.reason}`,
+    consumed_plan_item_ids: planned ? [planned.id] : [],
+    skipped_plan_item_ids: [],
+    mode: contextPacket.data?.cofounder_mode || "explorer",
     proposed_belief_updates: [],
     proposed_records: [],
     recommendation: { ...recommendation, source_ids: [contextPacket.id, founderTurn.id] },
@@ -313,7 +317,10 @@ async function handleFounderMessage(projectId, userId, message, options = {}) {
       assistant_turn_id: persisted.assistantTurn.id,
       context_packet_id: saved.contextPacket.id,
       session_id: saved.sessionId,
-      message: saved.founderTurn.content
+      message: saved.founderTurn.content,
+      consumed_plan_item_ids: output.consumed_plan_item_ids || [],
+      skipped_plan_item_ids: output.skipped_plan_item_ids || [],
+      naming_prompted: (saved.responsePlan?.items || []).some(item => item.intent === "checkpoint_name_company" && (output.consumed_plan_item_ids || []).includes(item.id))
     }, extractionKey);
   } catch (error) {
     result.processing = { status: "unavailable", error: error.message };
@@ -370,8 +377,12 @@ async function handleEnrichmentJob(payload, { extractor = callOpenAIModel, propo
       if (experiment) await client.query("UPDATE experiments SET status='completed', completed_at=now() WHERE id=$1", [experiment.id]);
     }
     const latestMemory = await fullMemory(payload.project_id, client);
+    const namingWasPrompted = Boolean(payload.naming_prompted);
+    const candidateName = payload.message.trim().replace(/^(maybe|call it|we could call it|i'd call it|let's call it)[:\s]*/i, "").replace(/[.!?]+$/, "").trim();
+    const looksLikeNameResponse = namingWasPrompted && candidateName.length >= 2 && candidateName.length <= 120 && !/[?\n]/.test(candidateName);
     const readiness = discoveryPlan(latestMemory).checkpoint_ready;
-    await client.query("UPDATE projects SET checkpoint_status=$2, checkpoint_metadata=$3 WHERE id=$1", [payload.project_id, readiness ? "ready" : "not_ready", { readiness, source_turn_id: founderTurn.id }]);
+    const checkpointStatus = looksLikeNameResponse ? "snapshot_pending" : readiness ? "ready" : "not_ready";
+    await client.query("UPDATE projects SET checkpoint_status=$2, checkpoint_metadata=$3 WHERE id=$1", [payload.project_id, checkpointStatus, { readiness, source_turn_id: founderTurn.id, ...(looksLikeNameResponse ? { name_candidate: candidateName } : {}) }]);
     await client.query("UPDATE conversation_turns SET structured_payload=structured_payload || $2::jsonb WHERE id=$1", [payload.assistant_turn_id, JSON.stringify({ enrichment: output, enriched_at: new Date().toISOString() })]);
     await replacePlan(client, payload.project_id, payload.session_id, latestMemory, { sourceTurnId: founderTurn.id, sourceIds: [contextPacket.id, founderTurn.id], message: payload.message });
   });

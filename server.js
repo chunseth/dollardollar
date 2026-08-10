@@ -125,8 +125,10 @@ async function chatHistory(projectId, sessionId = null) {
   return (await query(`SELECT id, session_id, context_packet_id, turn_no, actor_type, content, model, prompt_version, structured_payload, created_at FROM conversation_turns WHERE project_id=$1${filter} ORDER BY created_at ASC, turn_no ASC`, params)).rows;
 }
 async function chatDiscovery(projectId, sessionId = null) {
-  const packet = buildProjectContext(await fullMemory(projectId));
-  return { discovery_plan: packet.data.discovery_plan, discovery_facts: packet.data.discovery_facts || [], active_plan: await activePlan(projectId), pending_plan_items: await pendingPlanItems(projectId), session_id: sessionId };
+  const memory = await fullMemory(projectId);
+  const packet = buildProjectContext(memory);
+  const processing = (await query("SELECT id,job_type,status,attempts,last_error,created_at,updated_at FROM background_jobs WHERE project_id=$1 ORDER BY created_at DESC LIMIT 1", [projectId])).rows[0] || null;
+  return { discovery_plan: packet.data.discovery_plan, discovery_facts: packet.data.discovery_facts || [], active_plan: await activePlan(projectId), pending_plan_items: await pendingPlanItems(projectId), checkpoint_status: memory.project?.checkpoint_status || "not_ready", processing, session_id: sessionId };
 }
 
 async function materializeRoadmapGraph(client, projectId) {
@@ -210,7 +212,7 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
   }
   if (parts[1] !== "projects") return false;
   if (parts.length === 2 && method === "GET") return send(response, 200, { projects: (await query("SELECT * FROM projects WHERE user_id=$1 ORDER BY updated_at DESC", [owner])).rows });
-  if (parts.length === 2 && method === "POST") { const body = await readBody(request); const values = pick(body, projectFields), errors = validateProject(values); if (!values.name || !String(values.name).trim() || errors) return fail(response, 422, "Invalid project", { ...(!values.name || !String(values.name).trim() ? { name: "is required" } : {}), ...(errors || {}) }); const result = await transaction(async client => { const fields = ["user_id", "onboarding_state", ...Object.keys(values)], params = [owner, "discovery", ...Object.values(values)]; const row = (await client.query(`INSERT INTO projects (${fields.join(",")}) VALUES (${fields.map((_, i) => `$${i + 1}`).join(",")}) RETURNING *`, params)).rows[0]; await log(client, row.id, "founder", "created", "project", row.id, `Created project ${row.name}`, { ...values, onboarding_state: "discovery" }); return row; }); return send(response, 201, { project: result }); }
+  if (parts.length === 2 && method === "POST") { const body = await readBody(request); const values = pick(body, projectFields), errors = validateProject(values); if (!values.name || !String(values.name).trim() || errors) return fail(response, 422, "Invalid project", { ...(!values.name || !String(values.name).trim() ? { name: "is required" } : {}), ...(errors || {}) }); const result = await transaction(async client => { await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", [owner]); const unresolved = (await client.query("SELECT id, name FROM projects WHERE user_id=$1 AND onboarding_state='discovery' ORDER BY updated_at DESC, created_at DESC LIMIT 1", [owner])).rows[0]; if (unresolved) { const error = new Error("Resolve the current project checkpoint before starting another project."); error.status = 409; error.details = { project_id: unresolved.id, project_name: unresolved.name }; throw error; } const fields = ["user_id", "onboarding_state", ...Object.keys(values)], params = [owner, "discovery", ...Object.values(values)]; const row = (await client.query(`INSERT INTO projects (${fields.join(",")}) VALUES (${fields.map((_, i) => `$${i + 1}`).join(",")}) RETURNING *`, params)).rows[0]; await log(client, row.id, "founder", "created", "project", row.id, `Created project ${row.name}`, { ...values, onboarding_state: "discovery" }); return row; }); return send(response, 201, { project: result }); }
   const projectId = parts[2], existingProject = validUuid(projectId) ? await ownedProject(projectId, owner) : null; if (!existingProject) return fail(response, 404, "Project not found");
   if (parts[3] === "change-sets") {
     const context = { actor_id: owner, project_id: projectId };

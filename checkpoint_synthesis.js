@@ -61,12 +61,12 @@ function synthesizeCheckpoint(memory = {}) {
     primary_industry: field("", [], "No industry claim is made from discovery facts alone.")
   };
   const nameIsNew = !text(project.name) || text(project.name).toLowerCase() === "new project";
-  const nameSuggestion = titleSuggestion(solution?.statement || customer?.statement);
+  const nameSuggestion = text(project.checkpoint_metadata?.name_candidate) || titleSuggestion(solution?.statement || customer?.statement);
   return {
     version: "checkpoint-synthesis-v1",
     readiness: plan.checkpoint_ready,
     company_name: field(nameIsNew ? "" : project.name, nameIsNew ? [] : [{ ...project, id: project.id, source_turn_id: null, classification: "founder_statement", confidence: "high" }], "Existing project name is preserved; a new name must be founder supplied."),
-    company_name_suggestion: nameSuggestion ? { value: nameSuggestion, confidence: "low", status: "ai_suggestion", basis: "Derived from discovery wording; not selected automatically.", provenance: { source: "discovery_facts", source_fact_ids: [solution, customer].filter(Boolean).map(fact => String(fact.id)).filter(Boolean) } } : null,
+    company_name_suggestion: nameSuggestion ? { value: nameSuggestion, confidence: project.checkpoint_metadata?.name_candidate ? "medium" : "low", status: project.checkpoint_metadata?.name_candidate ? "founder_suggested" : "ai_suggestion", basis: project.checkpoint_metadata?.name_candidate ? "Captured from the founder's naming conversation; founder still confirms it." : "Derived from discovery wording; not selected automatically.", provenance: { source: project.checkpoint_metadata?.name_candidate ? "naming_conversation" : "discovery_facts", source_fact_ids: [solution, customer].filter(Boolean).map(fact => String(fact.id)).filter(Boolean) } } : null,
     fields,
     profile_confidence: confidence(Object.values(fields).filter(item => item.value)),
     unresolved_gaps: plan.ranked_gaps.filter(gap => gap.status !== "captured").map(gap => ({ field: gap.field, label: gap.label, confidence: gap.confidence, status: gap.status, question: gap.question })),

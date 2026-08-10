@@ -18,6 +18,15 @@ test("memory record ids are JSON-safe stable strings", () => {
   assert.deepEqual(memoryRecordIds({ project: { id: "project-1" }, assumptions: [{ id: "a-1" }, { id: "a-2" }], evidence: [] }), { project: ["project-1"], assumptions: ["a-1", "a-2"], evidence: [] });
 });
 
+test("a founder cannot start another project before resolving the current checkpoint", async () => {
+  const first = (await json(await api("/api/projects", { method: "POST", body: { name: "Unresolved project" } }))).project;
+  const response = await api("/api/projects", { method: "POST", body: { name: "Blocked project" } });
+  const body = await response.json();
+  assert.equal(response.status, 409);
+  assert.match(body.error, /checkpoint/i);
+  await api(`/api/projects/${first.id}`, { method: "DELETE" });
+});
+
 const { createServer } = require("../server");
 const { pool } = require("../db");
 const owner = `chat-founder-${Date.now()}`;
