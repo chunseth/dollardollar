@@ -8,9 +8,64 @@ const { buildContextPacket } = require("./context");
 const { persistRecommendation } = require("./recommendations");
 const { validateCofounderOutput, validateDeterministicRecommendationContext } = require("./ai_cofounder_contract");
 const { proposeChangeSet } = require("./change_sets");
+const { cofounderOutputSchema } = require("./ai_cofounder_contract");
 
-const promptVersion = "phase-6-local-v1";
+const OPENAI_URL = "https://api.openai.com/v1/responses";
+const promptVersion = "phase-6-openai-v1";
+const model = process.env.COFOUNDER_MODEL || process.env.OPENAI_MODEL || "gpt-5.5";
+const timeoutMs = Number(process.env.COFOUNDER_TIMEOUT_MS) || 90_000;
 const safeMessage = "I saved your message, but I could not produce a validated cofounder response. Please try again.";
+const openAICofounderSchema = JSON.parse(JSON.stringify(cofounderOutputSchema));
+// Strict Structured Outputs requires every declared property to be required.
+openAICofounderSchema.properties.proposed_belief_updates.items.required.push("evidence_links");
+
+const cofounderInstructions = `You are an AI cofounder helping a founder reach first revenue.
+
+Use only the supplied project context and the founder's latest message. Do not invent market facts, customer evidence, prices, or outcomes. Ask at most one focused question at a time. Prefer observable behavior and payment evidence over opinions. Treat founder statements as unverified unless the founder explicitly reports an observed result. The deterministic recommendation in the context is authoritative for priority and state; explain it clearly and provide a concrete action_payload when useful.
+
+Return only the supplied JSON schema. Propose material memory updates instead of claiming that you wrote them. Every proposal must include source_ids. Use the provided context_packet_id and founder_turn_id as provenance for proposals; evidence_links may additionally reference evidence IDs present in the context. Set needs_founder_review true whenever you propose a belief or record update. Keep the assistant_message concise, founder-facing, and specific.`;
+
+function responseText(result) {
+  if (typeof result?.output_text === "string") return result.output_text;
+  return result?.output?.flatMap(item => item.content || []).find(item => item.type === "output_text")?.text || "";
+}
+
+async function callOpenAIModel({ contextPacket, founderTurn }) {
+  if (!process.env.OPENAI_API_KEY) throw Object.assign(new Error("OPENAI_API_KEY is not configured."), { status: 503 });
+  const requestId = `cofounder-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(OPENAI_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, "X-Client-Request-Id": requestId },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model,
+        store: false,
+        max_output_tokens: 2_000,
+        text: { verbosity: "low", format: { type: "json_schema", name: "cofounder_output", strict: true, schema: openAICofounderSchema } },
+        input: [
+          { role: "system", content: [{ type: "input_text", text: cofounderInstructions }] },
+          { role: "user", content: [{ type: "input_text", text: JSON.stringify({ context_packet_id: contextPacket.id, founder_turn_id: founderTurn.id, context: contextPacket.data, founder_message: founderTurn.content }) }] }
+        ]
+      })
+    });
+    let payload = {};
+    try { payload = await response.json(); } catch {}
+    if (!response.ok) {
+      const detail = payload?.error?.message || `OpenAI returned HTTP ${response.status}`;
+      throw Object.assign(new Error(detail), { status: response.status >= 500 ? 502 : response.status, openaiCode: payload?.error?.code });
+    }
+    const raw = JSON.parse(responseText(payload) || "{}");
+    return { ...raw, model: payload.model || model, prompt_version: promptVersion };
+  } catch (error) {
+    if (controller.signal.aborted) throw Object.assign(new Error("The cofounder response took too long. Please try again."), { status: 504, cause: error });
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 // This is intentionally local and deterministic.  A caller must inject a
 // model seam to get a substantive response; Phase 6 never makes a live call.
@@ -190,4 +245,4 @@ async function handleFounderMessage(projectId, userId, message, options = {}) {
   return result;
 }
 
-module.exports = { handleFounderMessage, callCofounderModel, normalizeCofounderOutput, persistConversationTurn, idempotencyKey, fullMemory };
+module.exports = { handleFounderMessage, callCofounderModel, callOpenAIModel, normalizeCofounderOutput, persistConversationTurn, idempotencyKey, fullMemory };

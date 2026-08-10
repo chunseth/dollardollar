@@ -5,7 +5,7 @@ const path = require("path");
 const { query, transaction } = require("./db");
 const { createDraft, createPlan, normalizeDraft, fields: onboardingFields, industries, industryModules, revenuePathFields, projectTitle } = require("./onboarding");
 const { buildProjectContext } = require("./context");
-const { handleFounderMessage } = require("./cofounder");
+const { handleFounderMessage, callOpenAIModel } = require("./cofounder");
 const { recalculateRecommendation, recommendationHistory } = require("./recommendations");
 const { createBeliefFromAssumption, appendBeliefVersion, linkEvidenceToBeliefVersion } = require("./beliefs");
 const { proposeChangeSet: defaultProposeChangeSet, approveChangeSet, approveChangeSetItems, rejectChangeSet, editChangeSetItem, getPendingChangeSetsForProject, applyApprovedChangeSet } = require("./change_sets");
@@ -103,7 +103,7 @@ function validateAssistantPayload(payload) {
 }
 // `createServer({ generateAssistant })` is the test seam. It accepts exactly this
 // JSON-safe payload shape and never reads a request-supplied assistant payload.
-// Production currently uses this stable placeholder instead of making an OpenAI call.
+// The placeholder remains available for deterministic tests and local fallback.
 function placeholderAssistant({ contextPacket, founderTurn }) {
   return {
     assistant_message: "I saved your message. AI responses are not configured yet, so I cannot generate a substantive recommendation.",
@@ -118,7 +118,7 @@ async function chatHistory(projectId) {
   return (await query("SELECT id, session_id, context_packet_id, turn_no, actor_type, content, model, prompt_version, structured_payload, created_at FROM conversation_turns WHERE project_id=$1 ORDER BY created_at ASC, turn_no ASC", [projectId])).rows;
 }
 
-async function api(request, response, url, generatePlan = createPlan, generateAssistant = placeholderAssistant, proposeCofounderChangeSet = defaultProposeChangeSet) {
+async function api(request, response, url, generatePlan = createPlan, generateAssistant = callOpenAIModel, proposeCofounderChangeSet = defaultProposeChangeSet) {
   const parts = url.pathname.split("/").filter(Boolean); const method = request.method; const owner = userId(request);
   if (url.pathname === "/api/onboarding/draft" && method === "POST") { if (!allowDraft(request)) return fail(response, 429, "Too many onboarding drafts. Please wait a minute and try again."); const draft = await createDraft(await readBody(request)); return send(response, 200, { draft, requires_follow_up: draft.requires_follow_up === true }); }
   if (url.pathname === "/api/onboarding/confirm" && method === "POST") {
@@ -155,7 +155,7 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
   }
   if (parts[1] !== "projects") return false;
   if (parts.length === 2 && method === "GET") return send(response, 200, { projects: (await query("SELECT * FROM projects WHERE user_id=$1 ORDER BY updated_at DESC", [owner])).rows });
-  if (parts.length === 2 && method === "POST") { const body = await readBody(request); const values = pick(body, projectFields), errors = validateProject(values); if (!values.name || !String(values.name).trim() || errors) return fail(response, 422, "Invalid project", { ...(!values.name || !String(values.name).trim() ? { name: "is required" } : {}), ...(errors || {}) }); const result = await transaction(async client => { const fields = ["user_id", ...Object.keys(values)], params = [owner, ...Object.values(values)]; const row = (await client.query(`INSERT INTO projects (${fields.join(",")}) VALUES (${fields.map((_, i) => `$${i + 1}`).join(",")}) RETURNING *`, params)).rows[0]; await log(client, row.id, "founder", "created", "project", row.id, `Created project ${row.name}`, values); return row; }); return send(response, 201, { project: result }); }
+  if (parts.length === 2 && method === "POST") { const body = await readBody(request); const values = pick(body, projectFields), errors = validateProject(values); if (!values.name || !String(values.name).trim() || errors) return fail(response, 422, "Invalid project", { ...(!values.name || !String(values.name).trim() ? { name: "is required" } : {}), ...(errors || {}) }); const result = await transaction(async client => { const fields = ["user_id", "onboarding_state", ...Object.keys(values)], params = [owner, "discovery", ...Object.values(values)]; const row = (await client.query(`INSERT INTO projects (${fields.join(",")}) VALUES (${fields.map((_, i) => `$${i + 1}`).join(",")}) RETURNING *`, params)).rows[0]; await log(client, row.id, "founder", "created", "project", row.id, `Created project ${row.name}`, { ...values, onboarding_state: "discovery" }); return row; }); return send(response, 201, { project: result }); }
   const projectId = parts[2], existingProject = validUuid(projectId) ? await ownedProject(projectId, owner) : null; if (!existingProject) return fail(response, 404, "Project not found");
   if (parts[3] === "change-sets") {
     const context = { actor_id: owner, project_id: projectId };
@@ -183,6 +183,14 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
     return fail(response, 404, "Change-set route not found");
   }
   if (parts[3] === "chat" && parts.length === 4 && method === "GET") return send(response, 200, { turns: await chatHistory(projectId) });
+  if (parts[3] === "checkpoint" && parts.length === 4 && method === "POST") {
+    const row = await transaction(async client => {
+      const result = await client.query("UPDATE projects SET onboarding_state='active' WHERE id=$1 RETURNING *", [projectId]);
+      await log(client, projectId, "founder", "confirmed", "project_checkpoint", projectId, "Reached the first company checkpoint", { onboarding_state: "active" });
+      return result.rows[0];
+    });
+    return send(response, 200, { project: row });
+  }
   if (parts[3] === "recommendation" && parts.length === 4 && method === "GET") {
     const recommendation = (await query("SELECT id, context_packet_id, recommendation, primary_issue_id, primary_issue_text, state, source_context, version, supersedes_id, created_at FROM recommendations WHERE project_id=$1 AND status='active' ORDER BY version DESC, created_at DESC LIMIT 1", [projectId])).rows[0];
     return send(response, 200, { recommendation: recommendation || null });
@@ -228,7 +236,7 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
   return false;
 }
 
-function createServer({ generatePlan = createPlan, generateAssistant = placeholderAssistant, proposeChangeSet = defaultProposeChangeSet } = {}) {
+function createServer({ generatePlan = createPlan, generateAssistant = callOpenAIModel, proposeChangeSet = defaultProposeChangeSet } = {}) {
 const server = http.createServer(async (request, response) => {
   try {
     const url = new URL(request.url, `http://${request.headers.host}`);

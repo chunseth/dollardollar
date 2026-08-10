@@ -8,9 +8,12 @@ const app = fs.readFileSync(path.join(root, "app.js"), "utf8");
 const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
 const browserFiles = [app, html, fs.readFileSync(path.join(root, "styles.css"), "utf8"), fs.readFileSync(path.join(root, "overrides.css"), "utf8")].join("\n");
 
-test("Phase 7 chat navigation and onboarding route are present", () => {
+test("Conversation-first discovery mode is wired", () => {
   assert.match(html, /href="#chat"[^>]*data-view-link="chat"/);
-  assert.match(app, /const views = \{chat, cofounder: chat/);
+  assert.match(app, /function discoveryMode\(\)/);
+  assert.match(app, /function discoveryLearning\(\)/);
+  assert.match(app, /data-action="complete-checkpoint"/);
+  assert.match(app, /data-gated-nav/);
   assert.match(app, /location\.hash="chat";loadMemory\(project\.id\)/);
   assert.match(app, /data-action="open-chat"/);
 });
