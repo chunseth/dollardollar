@@ -67,8 +67,10 @@ function hasNewInputFor(issue, active, memory) {
 function deterministicRecommendation(memory = {}, rankedIssues = rankUnresolvedIssues(memory)) {
   const issue = rankedIssues[0] || null;
   if (!issue) return {
-    state: "wait", primary_issue: "No unresolved issue is currently recorded.", reason: "Wait for new founder input or evidence before creating more work.",
-    action_payload: { rule: "no_unresolved_issue" }, confidence: 1, source_ids: [], rule: "no_unresolved_issue", issue: null
+    state: memory.project?.onboarding_state === "discovery" ? "question" : "wait",
+    primary_issue: memory.project?.onboarding_state === "discovery" ? "The customer and problem still need to be narrowed." : "No unresolved issue is currently recorded.",
+    reason: memory.project?.onboarding_state === "discovery" ? "Learn one more concrete detail about the founder's customer or problem before creating an assumption." : "Wait for new founder input or evidence before creating more work.",
+    action_payload: { rule: memory.project?.onboarding_state === "discovery" ? "discovery_question" : "no_unresolved_issue" }, confidence: 1, source_ids: [], rule: memory.project?.onboarding_state === "discovery" ? "discovery_question" : "no_unresolved_issue", issue: null
   };
   const active = activeWorkFor(issue, memory);
   const activeWithoutNewInput = (active.tasks.length || active.experiments.length) && !hasNewInputFor(issue, active, memory);

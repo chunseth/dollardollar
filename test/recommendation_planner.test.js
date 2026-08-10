@@ -21,6 +21,12 @@ test("planner follows approved question, known-task, experiment, then relevant-w
   assert.equal(planRecommendation(base({ assumptions: [{ id: "a", statement: "Moderate uncertainty", status: "untested", importance: 2, uncertainty: 3, risk_score: 50 }], tasks: [{ id: "t", assumption_id: "a", status: "doing", created_at: "2026-01-02T00:00:00Z" }] })).recommendation.state, "wait");
 });
 
+test("discovery projects ask for scope instead of waiting with no recorded issue", () => {
+  const plan = planRecommendation({ project: { id: "p", onboarding_state: "discovery" }, assumptions: [], evidence: [], tasks: [], experiments: [], assumption_evidence: [] });
+  assert.equal(plan.recommendation.state, "question");
+  assert.equal(plan.recommendation.rule, "discovery_question");
+});
+
 test("active-work suppression is scoped to the selected issue identity, with an explicit legacy text fallback", () => {
   const issue = { id: "a", statement: "Validate recurring billing", status: "untested", importance: 3, uncertainty: 3, risk_score: 50 };
   const unrelated = planRecommendation(base({ assumptions: [issue], tasks: [{ id: "other", assumption_id: "b", status: "doing", created_at: "2026-01-02T00:00:00Z" }] }));

@@ -40,7 +40,7 @@ function validateRecommendation(recommendation, { allowEmptySourceIds = false } 
 function validateDeterministicRecommendationContext(recommendation) {
   if (!isObject(recommendation)) throw validationError("Deterministic recommendation context must be an object.");
   for (const field of deterministicRecommendationFields) if (!(field in recommendation)) throw validationError(`Deterministic recommendation context requires ${field}.`);
-  validateRecommendation(recommendation, { allowEmptySourceIds: recommendation.rule === "no_unresolved_issue" });
+  validateRecommendation(recommendation, { allowEmptySourceIds: ["no_unresolved_issue", "discovery_question"].includes(recommendation.rule) });
   if (!isNonEmptyString(recommendation.rule)) throw validationError("Deterministic recommendation context requires a rule.");
   return recommendation;
 }

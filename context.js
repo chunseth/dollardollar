@@ -84,7 +84,7 @@ function buildProjectContext(memory = {}) {
   addIds(included_memory_record_ids, "conversation_turns", turns);
   if (recommendation?.id) included_memory_record_ids.recommendations = [String(recommendation.id)];
   const data = {
-    project_snapshot: compact(project, ["id", "name", "short_description", "stage", "status", "target_customer", "problem_statement", "solution_summary", "revenue_model", "pricing_hypothesis", "validation_stage", "project_memory_summary", "founder_goal", "founder_constraints", "primary_industry"]),
+    project_snapshot: compact(project, ["id", "name", "onboarding_state", "short_description", "stage", "status", "target_customer", "problem_statement", "solution_summary", "revenue_model", "pricing_hypothesis", "validation_stage", "project_memory_summary", "founder_goal", "founder_constraints", "primary_industry"]),
     first_dollar_path: project?.first_dollar_path || {},
     top_assumptions: assumptions.map(record => compact(record, ["id", "statement", "category", "status", "priority", "confidence", "importance", "uncertainty", "risk_score", "revenue_blocker"])),
     recent_evidence: evidence.map(record => compact(record, ["id", "source_type", "source_title", "summary", "source_date", "strength", "confidence", "specificity", "recency", "bias_risk", "willingness_to_pay_signal", "behavior_vs_opinion", "created_at"])),
