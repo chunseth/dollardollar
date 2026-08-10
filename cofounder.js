@@ -6,7 +6,7 @@ const crypto = require("crypto");
 const { query, transaction } = require("./db");
 const { buildContextPacket } = require("./context");
 const { persistRecommendation } = require("./recommendations");
-const { validateCofounderOutput } = require("./ai_cofounder_contract");
+const { validateCofounderOutput, validateDeterministicRecommendationContext } = require("./ai_cofounder_contract");
 const { proposeChangeSet } = require("./change_sets");
 
 const promptVersion = "phase-6-local-v1";
@@ -80,6 +80,7 @@ function normalizeCofounderOutput(raw, contextPacket, founderTurn, plan = null) 
   // state are deterministic policy and cannot be redirected by model output.
   const deterministic = plan?.recommendation || contextPacket.data?.deterministic_recommendation;
   if (deterministic) {
+    validateDeterministicRecommendationContext(deterministic);
     normalized.recommendation = {
       state: deterministic.state,
       primary_issue: deterministic.primary_issue,

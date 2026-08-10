@@ -153,8 +153,13 @@ async function applyItem(client, projectId, item, actor, sourceTurnId) {
     return { entity_id: beliefId, belief_version_id: version.id };
   }
   if (type === "recommendation") {
-    await client.query("UPDATE recommendations SET status='superseded' WHERE project_id=$1 AND status='active'", [projectId]);
-    const row = (await client.query("INSERT INTO recommendations (project_id,recommendation,status) VALUES ($1,$2,'active') RETURNING id", [projectId, payload])).rows[0];
+    // Use the same project lock and replacement sequence as the regular
+    // recommender so reviewed recommendations retain one-current/history
+    // guarantees instead of bypassing the normalized persistence contract.
+    await client.query("SELECT id FROM projects WHERE id=$1 FOR UPDATE", [projectId]);
+    const previous = (await client.query("SELECT id, version FROM recommendations WHERE project_id=$1 AND status='active' FOR UPDATE", [projectId])).rows[0] || null;
+    if (previous) await client.query("UPDATE recommendations SET status='superseded' WHERE id=$1", [previous.id]);
+    const row = (await client.query("INSERT INTO recommendations (project_id,recommendation,primary_issue_text,state,source_context,version,supersedes_id,status) VALUES ($1,$2,$3,$4,$5,$6,$7,'active') RETURNING id", [projectId, payload, payload.primary_issue, payload.state, { approved_change_set: true, source_ids: payload.source_ids }, previous ? Number(previous.version) + 1 : 1, previous?.id || null])).rows[0];
     return { entity_id: row.id };
   }
   if (item.operation === "link") throw fail("Link operations are only supported for beliefs");
@@ -166,7 +171,7 @@ async function applyApprovedChangeSet(projectId, changeSetId, context = {}) {
   const actor = await auth(query, projectId, context);
   try {
     return await transaction(async client => { const set = await withSet(client, projectId, changeSetId); if (set.status === "applied") return { ...set, idempotent: true }; if (set.status !== "approved" || (set.expires_at && new Date(set.expires_at) <= new Date())) throw fail("Change set is not approved for application"); const items = (await client.query("SELECT * FROM change_set_items WHERE change_set_id=$1 ORDER BY sequence_number FOR UPDATE", [set.id])).rows.filter(item => item.review_status === "approved"); if (!items.length) throw fail("Change set has no approved items"); await client.query("UPDATE change_sets SET status='applying' WHERE id=$1", [set.id]); for (const item of items) { const result = await applyItem(client, projectId, item, actor, set.source_turn_id); await client.query("UPDATE change_set_items SET review_status='applied',application_result_metadata=$2 WHERE id=$1 RETURNING *", [item.id, result]); const eventId = await audit(client, projectId, "founder", actor, "applied", item.record_type, result.entity_id, { change_set_id: set.id, item_id: item.id, operation: item.operation, before: item.operation === "create" ? null : item.original_payload, after: item.current_payload }); if (result.belief_version_id) await client.query("UPDATE belief_versions SET source_event_id=$1,source_user_id=$2 WHERE id=$3", [eventId, actor, result.belief_version_id]); }
-      const applied = (await client.query("UPDATE change_sets SET status='applied',applied_at=now(),applied_by=$2,application_metadata=$3 WHERE id=$1 RETURNING *", [set.id, actor, { applied_item_count: items.length }])).rows[0]; await audit(client, projectId, "founder", actor, "applied", "change_set", set.id, { item_count: items.length }); return { ...applied, idempotent: false }; });
+      const applied = (await client.query("UPDATE change_sets SET status='applied',applied_at=now(),applied_by=$2,application_metadata=$3 WHERE id=$1 RETURNING *", [set.id, actor, { applied_item_count: items.length, applied_record_types: [...new Set(items.map(item => item.record_type))] }])).rows[0]; await audit(client, projectId, "founder", actor, "applied", "change_set", set.id, { item_count: items.length }); return { ...applied, idempotent: false }; });
   } catch (error) {
     // The application transaction has rolled back, so no item or entity write
     // survives. Persist the failure state and its audit event together in a

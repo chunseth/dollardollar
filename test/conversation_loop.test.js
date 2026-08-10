@@ -216,17 +216,20 @@ test("state changes recalculate atomically and preserve readable recommendation 
   assert.equal((await json(await api(`/api/projects/${project.id}/recommendation`))).recommendation.state, "question");
   await json(await api(`/api/projects/${project.id}/evidence`, { method: "POST", body: { source_type: "interview", source_title: "Interview", summary: "One operator described the problem" } }));
   const experiment = (await json(await api(`/api/projects/${project.id}/experiments`, { method: "POST", body: { assumption_id: assumption.id, title: "Paid offer", hypothesis: "Operators will pay", success_metric: "One deposit" } }))).experiment;
-  assert.equal((await json(await api(`/api/projects/${project.id}/recommendation`))).recommendation.state, "wait");
+  assert.equal((await json(await api(`/api/projects/${project.id}/recommendation`))).recommendation.state, "experiment");
   await json(await api(`/api/projects/${project.id}/experiments/${experiment.id}`, { method: "PATCH", body: { status: "completed" } }));
   const task = (await json(await api(`/api/projects/${project.id}/tasks`, { method: "POST", body: { assumption_id: assumption.id, title: "Ask one operator" } }))).task;
   await json(await api(`/api/projects/${project.id}/tasks/${task.id}`, { method: "PATCH", body: { status: "doing" } }));
-  assert.equal((await json(await api(`/api/projects/${project.id}/recommendation`))).recommendation.state, "wait");
+  assert.equal((await json(await api(`/api/projects/${project.id}/recommendation`))).recommendation.state, "experiment");
   await json(await api(`/api/projects/${project.id}/tasks/${task.id}`, { method: "PATCH", body: { status: "done" } }));
   const history = await json(await api(`/api/projects/${project.id}/recommendation/history`));
   assert.ok(history.recommendations.length >= 7);
   assert.equal(history.recommendations.filter(item => item.status === "active").length, 1);
   assert.ok(history.recommendations[0].source_context.packet);
   assert.ok(history.recommendations.some(item => item.supersedes_id));
+  assert.equal(new Set(history.recommendations.map(item => item.version)).size, history.recommendations.length);
+  const ids = new Set(history.recommendations.map(item => item.id));
+  assert.ok(history.recommendations.filter(item => item.supersedes_id).every(item => ids.has(item.supersedes_id)));
   await api(`/api/projects/${project.id}`, { method: "DELETE" });
 });
 

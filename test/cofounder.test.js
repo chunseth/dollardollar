@@ -33,11 +33,16 @@ test("local default model is valid and never needs a live dependency", async () 
 });
 
 test("a valid model response cannot change deterministic priority or state", () => {
-  const deterministic = { state: "wait", primary_issue: "Active outreach", reason: "Wait for the active task.", action_payload: { rule: "active_work" }, confidence: 1, source_ids: ["task:t-1"] };
+  const deterministic = { state: "wait", primary_issue: "Active outreach", reason: "Wait for the active task.", action_payload: { rule: "active_work" }, confidence: 1, source_ids: ["task:t-1"], rule: "active_work" };
   const normalized = normalizeCofounderOutput(output("experiment"), { id: "context-1", data: { deterministic_recommendation: deterministic } }, founderTurn);
   assert.equal(normalized.recommendation.state, "wait");
   assert.equal(normalized.recommendation.primary_issue, "Active outreach");
   assert.equal(normalized.recommendation.reason, "The result needs one more validation step.");
+});
+
+test("invalid deterministic recommendation context is rejected before model wording is shaped", () => {
+  const invalid = { state: "task", primary_issue: "Payment evidence", reason: "Do the work.", action_payload: {}, confidence: 1, source_ids: ["a"] };
+  assert.throws(() => normalizeCofounderOutput(output("task"), { id: "context-1", data: { deterministic_recommendation: invalid } }, founderTurn), /Deterministic recommendation context requires rule/);
 });
 
 test("proposal idempotency is deterministic for the same proposal retry, not a newly-created assistant turn", () => {

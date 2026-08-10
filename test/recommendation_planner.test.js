@@ -14,9 +14,19 @@ test("planner ranks every unresolved issue with stable documented tie breakers",
   assert.deepEqual(first.map(issue => issue.rank), [1, 2]);
 });
 
-test("planner rules cover question, task, experiment, and wait with active-work precedence", () => {
+test("planner follows approved question, known-task, experiment, then relevant-wait precedence", () => {
   assert.equal(planRecommendation(base({ project: { id: "p" } })).recommendation.state, "question");
   assert.equal(planRecommendation(base({ assumptions: [{ id: "a", statement: "Defined", status: "untested", importance: 2, uncertainty: 2, risk_score: 20 }] })).recommendation.state, "task");
   assert.equal(planRecommendation(base()).recommendation.state, "experiment");
-  assert.equal(planRecommendation(base({ tasks: [{ id: "t", assumption_id: "a", status: "doing" }] })).recommendation.state, "wait");
+  assert.equal(planRecommendation(base({ assumptions: [{ id: "a", statement: "Moderate uncertainty", status: "untested", importance: 2, uncertainty: 3, risk_score: 50 }], tasks: [{ id: "t", assumption_id: "a", status: "doing", created_at: "2026-01-02T00:00:00Z" }] })).recommendation.state, "wait");
+});
+
+test("active-work suppression is scoped to the selected issue identity, with an explicit legacy text fallback", () => {
+  const issue = { id: "a", statement: "Validate recurring billing", status: "untested", importance: 3, uncertainty: 3, risk_score: 50 };
+  const unrelated = planRecommendation(base({ assumptions: [issue], tasks: [{ id: "other", assumption_id: "b", status: "doing", created_at: "2026-01-02T00:00:00Z" }] }));
+  assert.equal(unrelated.recommendation.state, "task");
+  const legacy = planRecommendation(base({ assumptions: [issue], tasks: [{ id: "legacy", issue_text: "  validate   recurring billing ", status: "doing", created_at: "2026-01-02T00:00:00Z" }] }));
+  assert.equal(legacy.recommendation.state, "wait");
+  const newEvidence = planRecommendation(base({ assumptions: [issue], evidence: [{ id: "e", created_at: "2026-01-03T00:00:00Z" }], assumption_evidence: [{ assumption_id: "a", evidence_id: "e" }], tasks: [{ id: "legacy", issue_text: "Validate recurring billing", status: "doing", created_at: "2026-01-02T00:00:00Z" }] }));
+  assert.equal(newEvidence.recommendation.state, "task");
 });

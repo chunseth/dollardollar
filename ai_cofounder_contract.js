@@ -3,6 +3,7 @@ const beliefClassifications = ["unknown", "founder_statement", "assumption", "hy
 const evidenceRelationships = ["supports", "contradicts", "mixed", "neutral"];
 const recordTypes = ["belief", "evidence", "task", "experiment", "decision"];
 const recommendationFields = ["state", "primary_issue", "reason", "action_payload", "confidence", "source_ids"];
+const deterministicRecommendationFields = ["state", "primary_issue", "reason", "action_payload", "confidence", "source_ids", "rule"];
 
 const isObject = value => Boolean(value) && typeof value === "object" && !Array.isArray(value);
 const isNonEmptyString = value => typeof value === "string" && value.trim().length > 0;
@@ -33,6 +34,14 @@ function validateRecommendation(recommendation) {
   if (!isObject(recommendation.action_payload)) throw validationError("Recommendation action_payload must be an object.");
   if (typeof recommendation.confidence !== "number" || recommendation.confidence < 0 || recommendation.confidence > 1) throw validationError("Recommendation confidence must be a number from 0 to 1.");
   if (!isStringArray(recommendation.source_ids)) throw validationError("Recommendation requires provenance in source_ids.");
+  return recommendation;
+}
+
+function validateDeterministicRecommendationContext(recommendation) {
+  if (!isObject(recommendation)) throw validationError("Deterministic recommendation context must be an object.");
+  for (const field of deterministicRecommendationFields) if (!(field in recommendation)) throw validationError(`Deterministic recommendation context requires ${field}.`);
+  validateRecommendation(recommendation);
+  if (!isNonEmptyString(recommendation.rule)) throw validationError("Deterministic recommendation context requires a rule.");
   return recommendation;
 }
 
@@ -81,6 +90,11 @@ const recommendationSchema = {
   }
 };
 
+const deterministicRecommendationContextSchema = {
+  type: "object", additionalProperties: true, required: deterministicRecommendationFields,
+  properties: { ...recommendationSchema.properties, rule: { type: "string", minLength: 1 } }
+};
+
 const cofounderOutputSchema = {
   type: "object", additionalProperties: false, required: ["assistant_message", "proposed_belief_updates", "proposed_records", "recommendation", "needs_founder_review"],
   properties: {
@@ -92,4 +106,4 @@ const cofounderOutputSchema = {
   }
 };
 
-module.exports = { nextStates, beliefClassifications, evidenceRelationships, recordTypes, recommendationFields, evidenceLinkSchema, recommendationSchema, cofounderOutputSchema, validateEvidenceLink, validateRecommendation, validateBeliefUpdate, validateProposedRecord, validateCofounderOutput };
+module.exports = { nextStates, beliefClassifications, evidenceRelationships, recordTypes, recommendationFields, deterministicRecommendationFields, evidenceLinkSchema, recommendationSchema, deterministicRecommendationContextSchema, cofounderOutputSchema, validateEvidenceLink, validateRecommendation, validateDeterministicRecommendationContext, validateBeliefUpdate, validateProposedRecord, validateCofounderOutput };
