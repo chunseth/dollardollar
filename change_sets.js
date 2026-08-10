@@ -68,7 +68,8 @@ async function validateItem(client, projectId, item, expectedTopIssue) {
   if (operation === "link" && record_type !== "belief") throw fail("Link operations are only supported for beliefs");
   if (operation === "link" && (!Array.isArray(payload.evidence_links) || !payload.evidence_links.length)) throw fail("Belief link operations require evidence_links");
   if (record_type === "recommendation" && operation !== "create") throw fail("Recommendations only support create operations");
-  if (Object.keys(payload).some(key => !editable[record_type].has(key))) throw fail(`Unsupported ${record_type} proposal field`);
+  const unsupported = Object.keys(payload).find(key => !editable[record_type].has(key));
+  if (unsupported) throw fail(`Unsupported ${record_type} proposal field: ${unsupported}`);
   if (operation === "create" && item.target_entity_id) throw fail("Create operations cannot target an existing entity");
   if (operation !== "create" && !nonEmpty(item.target_entity_id)) throw fail("Update and link operations require a target entity ID");
   if (item.target_entity_id) await owns(client, tableFor[record_type], projectId, item.target_entity_id, "Target entity");

@@ -40,6 +40,17 @@ test("a valid model response cannot change deterministic priority or state", () 
   assert.equal(normalized.recommendation.reason, "The result needs one more validation step.");
 });
 
+test("discovery-only metadata does not leak into belief change sets", () => {
+  const normalized = normalizeCofounderOutput({ ...output("question"), proposed_belief_updates: [{ field: "problem", statement: "Owners struggle during long workdays", classification: "founder_statement", source_ids: ["turn-1"] }] }, contextPacket, founderTurn);
+  assert.equal(normalized.proposed_belief_updates[0].field, undefined);
+  assert.equal(normalized.proposed_belief_updates[0].statement, "Owners struggle during long workdays");
+});
+
+test("normalization derives founder review when the model omits the flag", () => {
+  const normalized = normalizeCofounderOutput({ ...output("question"), needs_founder_review: undefined }, contextPacket, founderTurn);
+  assert.equal(normalized.needs_founder_review, false);
+});
+
 test("invalid deterministic recommendation context is rejected before model wording is shaped", () => {
   const invalid = { state: "task", primary_issue: "Payment evidence", reason: "Do the work.", action_payload: {}, confidence: 1, source_ids: ["a"] };
   assert.throws(() => normalizeCofounderOutput(output("task"), { id: "context-1", data: { deterministic_recommendation: invalid } }, founderTurn), /Deterministic recommendation context requires rule/);

@@ -5,6 +5,7 @@ const path = require("path");
 const { query, transaction } = require("./db");
 const { createDraft, createPlan, normalizeDraft, fields: onboardingFields, industries, industryModules, revenuePathFields, projectTitle } = require("./onboarding");
 const { buildProjectContext } = require("./context");
+const { synthesizeCheckpoint } = require("./checkpoint_synthesis");
 const { handleFounderMessage, callOpenAIModel } = require("./cofounder");
 const { recalculateRecommendation, recommendationHistory } = require("./recommendations");
 const { createBeliefFromAssumption, appendBeliefVersion, linkEvidenceToBeliefVersion } = require("./beliefs");
@@ -78,10 +79,11 @@ async function fullMemory(projectId, executor = { query }, includeConversation =
   const decisions = await executor.query("SELECT * FROM decisions WHERE project_id=$1 ORDER BY created_at DESC", [projectId]);
   const milestones = await executor.query("SELECT * FROM roadmap_milestones WHERE project_id=$1 ORDER BY position", [projectId]);
   const links = await executor.query("SELECT ae.* FROM assumption_evidence ae JOIN evidence e ON e.id=ae.evidence_id WHERE e.project_id=$1", [projectId]);
+  const discoveryFacts = await executor.query("SELECT * FROM discovery_facts WHERE project_id=$1 ORDER BY created_at DESC", [projectId]);
   const beliefs = await executor.query("SELECT b.id, b.origin_assumption_id, b.current_version_id, b.is_active, bv.version_number, bv.statement, bv.classification, bv.validation_status, bv.confidence, bv.importance, bv.scope, bv.rationale, bv.source_event_id, bv.source_turn_id, bv.source_user_id, bv.source_assumption_id, bv.source_identifier, bv.provenance, bv.created_at AS version_created_at FROM beliefs b JOIN belief_versions bv ON bv.id=b.current_version_id WHERE b.project_id=$1 AND b.is_active=true ORDER BY bv.created_at DESC", [projectId]);
   const beliefEvidenceLinks = await executor.query("SELECT bel.* FROM belief_evidence_links bel JOIN belief_versions bv ON bv.id=bel.belief_version_id JOIN beliefs b ON b.id=bv.belief_id WHERE b.project_id=$1 ORDER BY bel.created_at DESC", [projectId]);
   const events = await executor.query("SELECT * FROM event_log WHERE project_id=$1 ORDER BY created_at DESC LIMIT 50", [projectId]);
-  const memory = { project: project.rows[0], assumptions: assumptions.rows, evidence: evidence.rows, experiments: experiments.rows, tasks: tasks.rows, decisions: decisions.rows, roadmap_milestones: milestones.rows, assumption_evidence: links.rows, beliefs: beliefs.rows, belief_evidence_links: beliefEvidenceLinks.rows, events: events.rows };
+  const memory = { project: project.rows[0], assumptions: assumptions.rows, evidence: evidence.rows, experiments: experiments.rows, tasks: tasks.rows, decisions: decisions.rows, roadmap_milestones: milestones.rows, assumption_evidence: links.rows, beliefs: beliefs.rows, belief_evidence_links: beliefEvidenceLinks.rows, discovery_facts: discoveryFacts.rows, events: events.rows };
   if (!includeConversation) return memory;
   const recommendation = await executor.query("SELECT id, context_packet_id, recommendation, created_at FROM recommendations WHERE project_id=$1 AND status='active' ORDER BY created_at DESC, id DESC LIMIT 1", [projectId]);
   const conversationTurns = await executor.query("SELECT id, session_id, turn_no, actor_type, content, created_at FROM conversation_turns WHERE project_id=$1 ORDER BY created_at DESC, turn_no DESC, id DESC LIMIT 20", [projectId]);
@@ -116,6 +118,10 @@ function placeholderAssistant({ contextPacket, founderTurn }) {
 }
 async function chatHistory(projectId) {
   return (await query("SELECT id, session_id, context_packet_id, turn_no, actor_type, content, model, prompt_version, structured_payload, created_at FROM conversation_turns WHERE project_id=$1 ORDER BY created_at ASC, turn_no ASC", [projectId])).rows;
+}
+async function chatDiscovery(projectId) {
+  const packet = buildProjectContext(await fullMemory(projectId));
+  return { discovery_plan: packet.data.discovery_plan, discovery_facts: packet.data.discovery_facts || [] };
 }
 
 async function api(request, response, url, generatePlan = createPlan, generateAssistant = callOpenAIModel, proposeCofounderChangeSet = defaultProposeChangeSet) {
@@ -182,16 +188,38 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
     }
     return fail(response, 404, "Change-set route not found");
   }
-  if (parts[3] === "chat" && parts.length === 4 && method === "GET") return send(response, 200, { turns: await chatHistory(projectId) });
+  if (parts[3] === "chat" && parts.length === 4 && method === "GET") return send(response, 200, { turns: await chatHistory(projectId), ...(await chatDiscovery(projectId)) });
+  if (parts[3] === "checkpoint" && parts[4] === "synthesis" && parts.length === 5 && method === "GET") {
+    const memory = await fullMemory(projectId);
+    const synthesis = synthesizeCheckpoint(memory);
+    if (existingProject.onboarding_state === "discovery" && !synthesis.readiness) return fail(response, 422, "Keep exploring the company shape before reviewing this snapshot.", { next_gap: synthesis.unresolved_gaps[0] || null });
+    return send(response, 200, { synthesis });
+  }
   if (parts[3] === "checkpoint" && parts.length === 4 && method === "POST") {
+    const body = await readBody(request), profile = body.profile && typeof body.profile === "object" && !Array.isArray(body.profile) ? body.profile : {};
+    const name = typeof profile.name === "string" ? profile.name.trim().slice(0, 160) : (typeof body.name === "string" ? body.name.trim().slice(0, 160) : "");
+    const discovery = buildProjectContext(await fullMemory(projectId)).data.discovery_plan;
+    if (existingProject.onboarding_state === "discovery" && !discovery.checkpoint_ready) return fail(response, 422, "Keep exploring the company shape before saving this snapshot.", { next_gap: discovery.next_gap });
     const row = await transaction(async client => {
-      const result = await client.query("UPDATE projects SET onboarding_state='active' WHERE id=$1 RETURNING *", [projectId]);
-      await log(client, projectId, "founder", "confirmed", "project_checkpoint", projectId, "Reached the first company checkpoint", { onboarding_state: "active" });
+      const current = (await client.query("SELECT * FROM projects WHERE id=$1 FOR UPDATE", [projectId])).rows[0];
+      if (!current) { const error = new Error("Project not found"); error.status = 404; throw error; }
+      if (!name && current.name.toLowerCase() === "new project") { const error = new Error("Choose a company name before saving the snapshot."); error.status = 422; throw error; }
+      const values = { ...profile, name: name || current.name };
+      for (const key of Object.keys(values)) if (!projectFields.includes(key) || key === "onboarding_state" || key === "user_id") delete values[key];
+      const errors = validateProject(values, current.primary_industry);
+      if (errors) { const error = new Error("Invalid confirmed company profile"); error.status = 422; error.details = errors; throw error; }
+      const alreadyConfirmed = current.onboarding_state === "active" && (await client.query("SELECT 1 FROM event_log WHERE project_id=$1 AND entity_type='project_checkpoint' AND event_type='confirmed' LIMIT 1", [projectId])).rowCount;
+      if (alreadyConfirmed) return current;
+      const entries = Object.entries(values);
+      const result = await client.query(`UPDATE projects SET ${entries.map(([key], index) => `${key}=$${index + 1}`).join(",")}, onboarding_state='active' WHERE id=$${entries.length + 1} RETURNING *`, [...entries.map(([, value]) => value), projectId]);
+      const sourceFacts = (await client.query("SELECT id, field_key, statement, classification, confidence, source_turn_id FROM discovery_facts WHERE project_id=$1 AND status='current' ORDER BY created_at", [projectId])).rows;
+      await log(client, projectId, "founder", "confirmed", "project_checkpoint", projectId, "Confirmed the first company snapshot", { onboarding_state: "active", profile: values, source_discovery_facts: sourceFacts });
       return result.rows[0];
     });
     return send(response, 200, { project: row });
   }
   if (parts[3] === "recommendation" && parts.length === 4 && method === "GET") {
+    if (existingProject.onboarding_state === "discovery") return send(response, 200, { recommendation: null });
     const recommendation = (await query("SELECT id, context_packet_id, recommendation, primary_issue_id, primary_issue_text, state, source_context, version, supersedes_id, created_at FROM recommendations WHERE project_id=$1 AND status='active' ORDER BY version DESC, created_at DESC LIMIT 1", [projectId])).rows[0];
     return send(response, 200, { recommendation: recommendation || null });
   }
@@ -261,4 +289,4 @@ function startupGuard() {
 
 if (require.main === module) { startupGuard(); createServer().listen(port, () => console.log(`First Dollar is running at http://localhost:${port}`)); }
 
-module.exports = { createServer, startupGuard, placeholderAssistant, validateAssistantPayload, memoryRecordIds, fullMemory };
+module.exports = { createServer, startupGuard, placeholderAssistant, validateAssistantPayload, memoryRecordIds, fullMemory, synthesizeCheckpoint };

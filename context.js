@@ -65,7 +65,9 @@ function topUnresolvedIssue(memory) {
 function buildProjectContext(memory = {}) {
   // Lazy to avoid the planner/context circular dependency at module load time.
   const { planRecommendation } = require("./recommendation_planner");
+  const { discoveryPlan } = require("./discovery_planner");
   const recommendationPlan = planRecommendation(memory);
+  const preSnapshotPlan = discoveryPlan(memory);
   const project = memory.project || null;
   const assumptions = [...(memory.assumptions || [])].sort((a, b) => numeric(b.risk_score) - numeric(a.risk_score) || newestFirst(a, b)).slice(0, LIMITS.assumptions);
   const evidence = [...(memory.evidence || [])].sort(newestFirst).slice(0, LIMITS.evidence);
@@ -92,12 +94,15 @@ function buildProjectContext(memory = {}) {
     open_tasks: tasks.map(record => compact(record, ["id", "assumption_id", "experiment_id", "title", "description", "priority", "status", "due_date", "impact_level", "created_at"])),
     latest_decisions: decisions.map(record => compact(record, ["id", "title", "decision", "reason", "status", "decided_at", "created_at"])),
     latest_recommendation: recommendation ? compact(recommendation, ["id", "recommendation", "created_at"]) : null,
+    discovery_facts: (memory.discovery_facts || []).filter(record => record.status === "current").map(record => compact(record, ["id", "field_key", "statement", "classification", "confidence", "source_turn_id", "created_at"])),
+    discovery_plan: preSnapshotPlan,
     recent_conversation_turns: turns.map(record => compact(record, ["id", "session_id", "turn_no", "actor_type", "content", "created_at"])),
     top_unresolved_issue: recommendationPlan.selected_issue,
     ranked_unresolved_issues: recommendationPlan.ranked_issues,
     deterministic_recommendation: recommendationPlan.recommendation,
     memory_record_ids: included_memory_record_ids
   };
+  for (const fact of memory.discovery_facts || []) if (fact.status === "current" && fact.id) included_memory_record_ids.discovery_facts = [...(included_memory_record_ids.discovery_facts || []), String(fact.id)];
   return { data, included_memory_record_ids };
 }
 

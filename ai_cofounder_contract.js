@@ -4,6 +4,7 @@ const evidenceRelationships = ["supports", "contradicts", "mixed", "neutral"];
 const recordTypes = ["belief", "evidence", "task", "experiment", "decision"];
 const recommendationFields = ["state", "primary_issue", "reason", "action_payload", "confidence", "source_ids"];
 const deterministicRecommendationFields = ["state", "primary_issue", "reason", "action_payload", "confidence", "source_ids", "rule"];
+const discoveryFactFields = ["customer_segment", "problem", "context", "current_workaround", "desired_outcome", "solution", "buyer", "first_dollar_offer"];
 
 const isObject = value => Boolean(value) && typeof value === "object" && !Array.isArray(value);
 const isNonEmptyString = value => typeof value === "string" && value.trim().length > 0;
@@ -65,15 +66,27 @@ function validateProposedRecord(record) {
   return record;
 }
 
+function validateDiscoveryFact(fact) {
+  if (!isObject(fact)) throw validationError("Discovery facts must be objects.");
+  assertAllowed(fact.field, discoveryFactFields, "discovery fact field");
+  if (!isNonEmptyString(fact.statement)) throw validationError("Discovery facts require a statement.");
+  assertAllowed(fact.classification, ["founder_statement", "inference", "assumption", "evidence_observation"], "discovery fact classification");
+  assertAllowed(fact.confidence, ["low", "medium", "high"], "discovery fact confidence");
+  if (!isStringArray(fact.source_ids)) throw validationError("Discovery facts require provenance in source_ids.");
+  return fact;
+}
+
 function validateCofounderOutput(output) {
   if (!isObject(output)) throw validationError("Cofounder output must be an object.");
   if (!isNonEmptyString(output.assistant_message)) throw validationError("Cofounder output requires assistant_message.");
+  if (output.discovery_facts !== undefined && !Array.isArray(output.discovery_facts)) throw validationError("Cofounder discovery_facts must be an array.");
   if (!Array.isArray(output.proposed_belief_updates)) throw validationError("Cofounder output requires proposed_belief_updates.");
   if (!Array.isArray(output.proposed_records)) throw validationError("Cofounder output requires proposed_records.");
   validateRecommendation(output.recommendation);
   if (typeof output.needs_founder_review !== "boolean") throw validationError("Cofounder output requires needs_founder_review.");
   output.proposed_belief_updates.forEach(validateBeliefUpdate);
   output.proposed_records.forEach(validateProposedRecord);
+  (output.discovery_facts || []).forEach(validateDiscoveryFact);
   return output;
 }
 
@@ -96,8 +109,9 @@ const deterministicRecommendationContextSchema = {
 };
 
 const cofounderOutputSchema = {
-  type: "object", additionalProperties: false, required: ["assistant_message", "proposed_belief_updates", "proposed_records", "recommendation", "needs_founder_review"],
+  type: "object", additionalProperties: false, required: ["assistant_message", "discovery_facts", "proposed_belief_updates", "proposed_records", "recommendation", "needs_founder_review"],
   properties: {
+    discovery_facts: { type: "array", items: { type: "object", additionalProperties: false, required: ["field", "statement", "classification", "confidence", "source_ids"], properties: { field: { type: "string", enum: discoveryFactFields }, statement: { type: "string", minLength: 1 }, classification: { type: "string", enum: ["founder_statement", "inference", "assumption", "evidence_observation"] }, confidence: { type: "string", enum: ["low", "medium", "high"] }, source_ids: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } } } } },
     assistant_message: { type: "string", minLength: 1 },
     proposed_belief_updates: { type: "array", items: { type: "object", additionalProperties: false, required: ["statement", "classification", "source_ids"], properties: { statement: { type: "string", minLength: 1 }, classification: { type: "string", enum: beliefClassifications }, source_ids: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } }, evidence_links: { type: "array", items: evidenceLinkSchema } } } },
     proposed_records: { type: "array", items: { type: "object", additionalProperties: false, required: ["type", "payload", "source_ids"], properties: { type: { type: "string", enum: recordTypes }, payload: { type: "object", additionalProperties: true }, source_ids: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } } } } },
@@ -106,4 +120,4 @@ const cofounderOutputSchema = {
   }
 };
 
-module.exports = { nextStates, beliefClassifications, evidenceRelationships, recordTypes, recommendationFields, deterministicRecommendationFields, evidenceLinkSchema, recommendationSchema, deterministicRecommendationContextSchema, cofounderOutputSchema, validateEvidenceLink, validateRecommendation, validateDeterministicRecommendationContext, validateBeliefUpdate, validateProposedRecord, validateCofounderOutput };
+module.exports = { nextStates, beliefClassifications, evidenceRelationships, recordTypes, recommendationFields, deterministicRecommendationFields, discoveryFactFields, evidenceLinkSchema, recommendationSchema, deterministicRecommendationContextSchema, cofounderOutputSchema, validateEvidenceLink, validateRecommendation, validateDeterministicRecommendationContext, validateBeliefUpdate, validateProposedRecord, validateDiscoveryFact, validateCofounderOutput };

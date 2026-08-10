@@ -8,6 +8,7 @@ const { buildContextPacket } = require("./context");
 const { persistRecommendation } = require("./recommendations");
 const { validateCofounderOutput, validateDeterministicRecommendationContext, cofounderOutputSchema } = require("./ai_cofounder_contract");
 const { proposeChangeSet } = require("./change_sets");
+const { discoveryPlan } = require("./discovery_planner");
 
 const OPENAI_URL = "https://api.openai.com/v1/responses";
 const promptVersion = "phase-6-openai-v1";
@@ -17,13 +18,13 @@ const safeMessage = "I saved your message, but I could not produce a validated c
 
 const cofounderInstructions = `You are an AI cofounder helping a founder reach first revenue. Speak like a thoughtful, friendly mentor—not a generic chatbot or an analyst writing a report.
 
-Use only the supplied project context and the founder's latest message. Do not invent market facts, customer evidence, prices, statistics, or outcomes. Keep the assistant_message to one or two short sentences and no more than 45 words. Ask exactly one natural, focused question when more context is needed. Do not use labels, preambles, bullet points, or phrases such as "unvalidated idea", "current system recommendation", "top unresolved issue", or "one focused question". Jump directly into a warm reflection or qualifier, then the question.
+Use only the supplied project context and the founder's latest message. Do not invent market facts, customer evidence, prices, statistics, or outcomes. Keep the assistant_message to one or two short sentences and no more than 45 words. Ask exactly one natural, focused question when more context is needed. Do not use labels, preambles, bullet points, or phrases such as "unvalidated idea", "current system recommendation", "top unresolved issue", or "one focused question". Avoid using colons and em dashes in the response. Jump directly into a warm reflection or qualifier, then the question.
 
 In early discovery, treat the founder's latest message as the source of truth for what they have already answered. If they already named a customer segment, do not ask who the customer is again; ask about the concrete problem, current workaround, frequency, setting, or first reachable slice. If the idea is vague, ask either for the specific customer or the problem—not both. A short grounded qualifier (for example, naming the tension or uncertainty in the founder's belief) is useful; never manufacture a statistic.
 
 Prefer observable behavior and payment evidence over opinions. Treat founder statements as unverified unless the founder explicitly reports an observed result. The deterministic recommendation in the context is authoritative for priority and state, but never mention that internal recommendation or claim that no issue exists. In discovery mode with no recorded issue, ask the next scoping question directly rather than saying to wait.
 
-Return only the supplied JSON schema. Propose material memory updates instead of claiming that you wrote them. Every proposal must include source_ids. Use the provided context_packet_id and founder_turn_id as provenance for proposals; evidence_links may additionally reference evidence IDs present in the context. Set needs_founder_review true whenever you propose a belief or record update. Keep the assistant_message concise, founder-facing, and specific.`;
+Return only the supplied JSON schema. Extract any newly stated or clearly inferred discovery facts into discovery_facts. Use the exact field that best fits each fact, and set confidence to high only when the founder was explicit. Do not repeat unchanged facts. While onboarding_state is discovery, keep proposed_belief_updates and proposed_records empty; discovery_facts are the only working-memory updates. After the snapshot, propose material memory updates instead of claiming that you wrote them. Every proposal must include source_ids. Task and experiment payloads must include either the current top_unresolved_issue_id or a concise justification. Use the provided context_packet_id and founder_turn_id as provenance for proposals; evidence_links may additionally reference evidence IDs present in the context. Set needs_founder_review true whenever you propose a belief or record update. Keep the assistant_message concise, founder-facing, and specific.`;
 
 function responseText(result) {
   if (typeof result?.output_text === "string") return result.output_text;
@@ -93,9 +94,10 @@ async function fullMemory(projectId, executor) {
   const tasks = await run("SELECT * FROM tasks WHERE project_id=$1 ORDER BY created_at", [projectId]);
   const decisions = await run("SELECT * FROM decisions WHERE project_id=$1 ORDER BY created_at DESC", [projectId]);
   const links = await run("SELECT ae.* FROM assumption_evidence ae JOIN evidence e ON e.id=ae.evidence_id WHERE e.project_id=$1", [projectId]);
+  const discoveryFacts = await run("SELECT * FROM discovery_facts WHERE project_id=$1 AND status='current' ORDER BY created_at DESC", [projectId]);
   const recommendation = await run("SELECT id, context_packet_id, recommendation, created_at FROM recommendations WHERE project_id=$1 AND status='active' ORDER BY created_at DESC, id DESC LIMIT 1", [projectId]);
   const turns = await run("SELECT id, session_id, turn_no, actor_type, content, created_at FROM conversation_turns WHERE project_id=$1 ORDER BY created_at DESC, turn_no DESC, id DESC LIMIT 20", [projectId]);
-  return { project: project.rows[0], assumptions: assumptions.rows, evidence: evidence.rows, experiments: experiments.rows, tasks: tasks.rows, decisions: decisions.rows, assumption_evidence: links.rows, latest_recommendation: recommendation.rows[0] || null, conversation_turns: turns.rows };
+  return { project: project.rows[0], assumptions: assumptions.rows, evidence: evidence.rows, experiments: experiments.rows, tasks: tasks.rows, decisions: decisions.rows, assumption_evidence: links.rows, discovery_facts: discoveryFacts.rows, latest_recommendation: recommendation.rows[0] || null, conversation_turns: turns.rows };
 }
 
 function modelError(code, error) {
@@ -107,6 +109,7 @@ function normalizeCofounderOutput(raw, contextPacket, founderTurn, plan = null) 
   // while making the Phase 1 object the only persisted structured payload.
   const output = raw?.structured_payload && raw?.assistant_message && raw?.recommendation ? {
     assistant_message: raw.assistant_message,
+    discovery_facts: raw.structured_payload.discovery_facts || [],
     proposed_belief_updates: raw.structured_payload.proposed_belief_updates || [],
     proposed_records: raw.structured_payload.proposed_records || [],
     recommendation: raw.recommendation,
@@ -116,10 +119,16 @@ function normalizeCofounderOutput(raw, contextPacket, founderTurn, plan = null) 
   if (!output || typeof output !== "object" || Array.isArray(output)) throw new Error("Cofounder model returned no object output.");
   const normalized = {
     assistant_message: output.assistant_message,
-    proposed_belief_updates: output.proposed_belief_updates,
+    discovery_facts: output.discovery_facts || [],
+    proposed_belief_updates: (output.proposed_belief_updates || []).map(update => {
+      // Discovery metadata such as `field` belongs in discovery_facts. Keep
+      // it from crossing into the versioned belief/change-set boundary.
+      const allowed = ["statement", "classification", "source_ids", "evidence_links", "confidence", "importance", "validation_status", "scope", "rationale", "provenance", "source_assumption_id", "top_unresolved_issue_id", "justification", "target_entity_id"];
+      return Object.fromEntries(Object.entries(update || {}).filter(([key]) => allowed.includes(key)));
+    }),
     proposed_records: output.proposed_records,
     recommendation: output.recommendation,
-    needs_founder_review: output.needs_founder_review,
+    needs_founder_review: typeof output.needs_founder_review === "boolean" ? output.needs_founder_review : Boolean((output.proposed_belief_updates || []).length || (output.proposed_records || []).length),
     model: typeof output.model === "string" && output.model ? output.model : "injected-cofounder",
     prompt_version: typeof output.prompt_version === "string" && output.prompt_version ? output.prompt_version : promptVersion
   };
@@ -131,6 +140,7 @@ function normalizeCofounderOutput(raw, contextPacket, founderTurn, plan = null) 
     else if (Array.isArray(item.source_ids)) item.source_ids = [...new Set([...item.source_ids, ...provenance])];
   };
   if (normalized.recommendation) attachProvenance(normalized.recommendation);
+  for (const item of normalized.discovery_facts || []) attachProvenance(item);
   for (const item of normalized.proposed_belief_updates || []) attachProvenance(item);
   for (const item of normalized.proposed_records || []) attachProvenance(item);
   validateCofounderOutput(normalized);
@@ -164,6 +174,14 @@ async function persistConversationTurn(projectId, message, userId = null) {
   });
 }
 
+async function persistDiscoveryFacts(client, projectId, facts, sourceTurnId) {
+  for (const fact of facts || []) {
+    const existing = (await client.query("SELECT id FROM discovery_facts WHERE project_id=$1 AND field_key=$2 AND status='current' FOR UPDATE", [projectId, fact.field])).rows[0];
+    if (existing) await client.query("UPDATE discovery_facts SET status='superseded', updated_at=now() WHERE id=$1", [existing.id]);
+    await client.query("INSERT INTO discovery_facts (project_id,field_key,statement,classification,confidence,source_turn_id,provenance) VALUES ($1,$2,$3,$4,$5,$6,$7)", [projectId, fact.field, fact.statement.trim(), fact.classification, fact.confidence, sourceTurnId, { source_ids: fact.source_ids, source: "cofounder_chat" }]);
+  }
+}
+
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
   if (value && typeof value === "object") return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
@@ -190,8 +208,9 @@ function idempotencyKey(projectId, output, contextPacket, founderTurn, retryKey 
 async function persistAssistantResponse(projectId, saved, output, userId, plan) {
   return transaction(async client => {
     const assistantTurn = (await client.query("INSERT INTO conversation_turns (session_id,project_id,context_packet_id,turn_no,actor_type,content,model,prompt_version,structured_payload) VALUES ($1,$2,$3,$4,'ai',$5,$6,$7,$8) RETURNING *", [saved.sessionId, projectId, saved.contextPacket.id, saved.nextTurn, output.assistant_message, output.model, output.prompt_version, output])).rows[0];
+    if (saved.contextPacket.data.project_snapshot?.onboarding_state === "discovery") await persistDiscoveryFacts(client, projectId, output.discovery_facts, saved.founderTurn.id);
     await client.query("INSERT INTO event_log (project_id,actor_type,actor_id,event_type,entity_type,entity_id,summary,payload) VALUES ($1,'ai',$2,'created','conversation_turn',$3,$4,$5)", [projectId, userId, assistantTurn.id, "Saved AI chat turn", { context_packet_id: saved.contextPacket.id, turn_no: assistantTurn.turn_no, model: output.model, prompt_version: output.prompt_version }]);
-    const recommendation = await persistRecommendation(client, projectId, saved.contextPacket, plan, output.recommendation);
+    const recommendation = saved.contextPacket.data.project_snapshot?.onboarding_state === "discovery" ? null : await persistRecommendation(client, projectId, saved.contextPacket, plan, output.recommendation);
     return { assistantTurn, recommendation };
   });
 }
@@ -226,7 +245,8 @@ async function handleFounderMessage(projectId, userId, message, options = {}) {
   const result = { founder_turn: saved.founderTurn, assistant_turn: persisted.assistantTurn, context_packet: saved.contextPacket, recommendation: persisted.recommendation, ...(fallbackError ? { error: fallbackError } : {}) };
   // A recommendation is persisted as conversation state; only proposed memory
   // updates cross the Phase 5 review boundary.
-  const hasMaterialProposal = output.proposed_belief_updates.length || output.proposed_records.length;
+  const isDiscovery = saved.contextPacket.data.project_snapshot?.onboarding_state === "discovery";
+  const hasMaterialProposal = !isDiscovery && (output.proposed_belief_updates.length || output.proposed_records.length);
   if (!hasMaterialProposal) return result;
   try {
     // The no-unresolved-issue wait state has no source record by design. The

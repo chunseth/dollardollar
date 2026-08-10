@@ -13,6 +13,9 @@ test("Conversation-first discovery mode is wired", () => {
   assert.match(app, /function discoveryMode\(\)/);
   assert.match(app, /function discoveryLearning\(\)/);
   assert.match(app, /data-action="complete-checkpoint"/);
+  assert.match(app, /Review company snapshot/);
+  assert.match(app, /checkpointConfirmForm/);
+  assert.match(app, /checkpoint\/synthesis/);
   assert.match(app, /data-gated-nav/);
   assert.match(app, /location\.hash="chat";loadMemory\(project\.id\)/);
   assert.match(app, /data-action="open-chat"/);
@@ -28,6 +31,8 @@ test("Chat loads project-scoped history, recommendations, and pending proposals"
 
 test("Chat submission, quick capture, and proposal review use existing API endpoints", () => {
   assert.match(app, /id==="chatForm"/);
+  assert.match(app, /e\.key!=="Enter" \|\| e\.shiftKey/);
+  assert.match(app, /e\.target\.form\.requestSubmit\(\)/);
   assert.match(app, /method:"POST",body:JSON\.stringify\(\{message,client_request_id/);
   assert.match(app, /if\(result\.error\|\|result\.proposal_error\)\{state\.chatDraft=message/);
   assert.match(app, /capture-task/);
