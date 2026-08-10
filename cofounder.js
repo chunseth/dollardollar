@@ -6,18 +6,14 @@ const crypto = require("crypto");
 const { query, transaction } = require("./db");
 const { buildContextPacket } = require("./context");
 const { persistRecommendation } = require("./recommendations");
-const { validateCofounderOutput, validateDeterministicRecommendationContext } = require("./ai_cofounder_contract");
+const { validateCofounderOutput, validateDeterministicRecommendationContext, cofounderOutputSchema } = require("./ai_cofounder_contract");
 const { proposeChangeSet } = require("./change_sets");
-const { cofounderOutputSchema } = require("./ai_cofounder_contract");
 
 const OPENAI_URL = "https://api.openai.com/v1/responses";
 const promptVersion = "phase-6-openai-v1";
 const model = process.env.COFOUNDER_MODEL || process.env.OPENAI_MODEL || "gpt-5.5";
 const timeoutMs = Number(process.env.COFOUNDER_TIMEOUT_MS) || 90_000;
 const safeMessage = "I saved your message, but I could not produce a validated cofounder response. Please try again.";
-const openAICofounderSchema = JSON.parse(JSON.stringify(cofounderOutputSchema));
-// Strict Structured Outputs requires every declared property to be required.
-openAICofounderSchema.properties.proposed_belief_updates.items.required.push("evidence_links");
 
 const cofounderInstructions = `You are an AI cofounder helping a founder reach first revenue.
 
@@ -44,7 +40,10 @@ async function callOpenAIModel({ contextPacket, founderTurn }) {
         model,
         store: false,
         max_output_tokens: 2_000,
-        text: { verbosity: "low", format: { type: "json_schema", name: "cofounder_output", strict: true, schema: openAICofounderSchema } },
+        // The contract deliberately permits extensible action and record
+        // payloads. Keep the schema response-formatted, then enforce the
+        // complete contract with validateCofounderOutput below.
+        text: { verbosity: "low", format: { type: "json_schema", name: "cofounder_output", strict: false, schema: cofounderOutputSchema } },
         input: [
           { role: "system", content: [{ type: "input_text", text: cofounderInstructions }] },
           { role: "user", content: [{ type: "input_text", text: JSON.stringify({ context_packet_id: contextPacket.id, founder_turn_id: founderTurn.id, context: contextPacket.data, founder_message: founderTurn.content }) }] }
