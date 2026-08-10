@@ -78,23 +78,23 @@ function deterministicRecommendation(memory = {}, rankedIssues = rankUnresolvedI
   // waiting rather than replacing work already in progress.
   const knownLowRisk = (issue.source_ids.evidence || []).length > 0 && !issue.revenue_blocker && issue.sort.risk_score < 70 && issue.sort.uncertainty < 4;
   const criticalOutsideWorld = issue.revenue_blocker || issue.sort.risk_score >= 70 || issue.sort.uncertainty >= 4;
-  // Explicit approved precedence: founder knowledge question, known low-risk
-  // task, critical outside-world experiment, then wait for relevant active
-  // work with no newer evidence or founder input. Active work is never
-  // project-wide: it must match the deterministic top issue above.
+  // Explicit approved precedence: founder knowledge question, wait for
+  // relevant active work with no newer evidence or founder input, known
+  // low-risk task, then critical outside-world experiment. Active work is
+  // never project-wide: it must match the deterministic top issue above.
   let state, rule, reason;
   if (missingFounderKnowledge) {
     state = "question"; rule = "missing_founder_context";
     reason = "A focused founder answer is required before assigning work for this issue.";
+  } else if (activeWithoutNewInput) {
+    state = "wait"; rule = "active_work";
+    reason = "Relevant active work already addresses this top issue; wait for its result instead of creating competing work.";
   } else if (knownLowRisk) {
     state = "task"; rule = "known_low_risk_task";
     reason = "This known, low-risk issue is ready for one concrete validation action.";
   } else if (criticalOutsideWorld) {
     state = "experiment"; rule = "critical_uncertainty";
     reason = "This high-risk unresolved issue needs a bounded test before more execution.";
-  } else if (activeWithoutNewInput) {
-    state = "wait"; rule = "active_work";
-    reason = "Relevant active work already addresses this top issue; wait for its result instead of creating competing work.";
   } else {
     state = "task"; rule = "actionable_validation";
     reason = "This unresolved issue is sufficiently defined for one concrete validation action.";

@@ -214,13 +214,14 @@ test("state changes recalculate atomically and preserve readable recommendation 
   const project = (await json(await api("/api/projects", { method: "POST", body: { name: "Recommendation triggers" } }))).project;
   const assumption = (await json(await api(`/api/projects/${project.id}/assumptions`, { method: "POST", body: { statement: "Operators will pay", category: "willingness_to_pay", importance: 3, uncertainty: 2, risk_score: 40 } }))).assumption;
   assert.equal((await json(await api(`/api/projects/${project.id}/recommendation`))).recommendation.state, "question");
+  await json(await api(`/api/projects/${project.id}`, { method: "PATCH", body: { target_customer: "Independent operators" } }));
   await json(await api(`/api/projects/${project.id}/evidence`, { method: "POST", body: { source_type: "interview", source_title: "Interview", summary: "One operator described the problem" } }));
   const experiment = (await json(await api(`/api/projects/${project.id}/experiments`, { method: "POST", body: { assumption_id: assumption.id, title: "Paid offer", hypothesis: "Operators will pay", success_metric: "One deposit" } }))).experiment;
-  assert.equal((await json(await api(`/api/projects/${project.id}/recommendation`))).recommendation.state, "experiment");
+  assert.equal((await json(await api(`/api/projects/${project.id}/recommendation`))).recommendation.state, "wait");
   await json(await api(`/api/projects/${project.id}/experiments/${experiment.id}`, { method: "PATCH", body: { status: "completed" } }));
   const task = (await json(await api(`/api/projects/${project.id}/tasks`, { method: "POST", body: { assumption_id: assumption.id, title: "Ask one operator" } }))).task;
   await json(await api(`/api/projects/${project.id}/tasks/${task.id}`, { method: "PATCH", body: { status: "doing" } }));
-  assert.equal((await json(await api(`/api/projects/${project.id}/recommendation`))).recommendation.state, "experiment");
+  assert.equal((await json(await api(`/api/projects/${project.id}/recommendation`))).recommendation.state, "wait");
   await json(await api(`/api/projects/${project.id}/tasks/${task.id}`, { method: "PATCH", body: { status: "done" } }));
   const history = await json(await api(`/api/projects/${project.id}/recommendation/history`));
   assert.ok(history.recommendations.length >= 7);

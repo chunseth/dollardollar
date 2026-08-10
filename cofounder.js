@@ -171,7 +171,14 @@ async function handleFounderMessage(projectId, userId, message, options = {}) {
   const hasMaterialProposal = output.proposed_belief_updates.length || output.proposed_records.length;
   if (!hasMaterialProposal) return result;
   try {
-    result.change_set = await (options.proposeChangeSet || proposeChangeSet)(projectId, output, {
+    // The no-unresolved-issue wait state has no source record by design. The
+    // persisted recommendation keeps source_ids empty, while the material
+    // proposal envelope still needs chat provenance for its own validation.
+    const proposalOutput = output.recommendation.source_ids.length ? output : {
+      ...output,
+      recommendation: { ...output.recommendation, source_ids: [saved.contextPacket.id, persisted.assistantTurn.id] }
+    };
+    result.change_set = await (options.proposeChangeSet || proposeChangeSet)(projectId, proposalOutput, {
       source_turn_id: persisted.assistantTurn.id,
       idempotency_key: idempotencyKey(projectId, output, saved.contextPacket, saved.founderTurn, options.idempotencyKey || options.idempotency_key || options.clientRequestId || options.client_request_id),
       include_recommendation: false,
@@ -183,4 +190,4 @@ async function handleFounderMessage(projectId, userId, message, options = {}) {
   return result;
 }
 
-module.exports = { handleFounderMessage, callCofounderModel, normalizeCofounderOutput, persistConversationTurn, idempotencyKey };
+module.exports = { handleFounderMessage, callCofounderModel, normalizeCofounderOutput, persistConversationTurn, idempotencyKey, fullMemory };

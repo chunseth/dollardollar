@@ -26,21 +26,21 @@ function validateEvidenceLink(link) {
   return link;
 }
 
-function validateRecommendation(recommendation) {
+function validateRecommendation(recommendation, { allowEmptySourceIds = false } = {}) {
   if (!isObject(recommendation)) throw validationError("Recommendation must be an object.");
   for (const field of recommendationFields) if (!(field in recommendation)) throw validationError(`Recommendation requires ${field}.`);
   assertAllowed(recommendation.state, nextStates, "next state");
   for (const field of ["primary_issue", "reason"]) if (!isNonEmptyString(recommendation[field])) throw validationError(`Recommendation ${field} must be a non-empty string.`);
   if (!isObject(recommendation.action_payload)) throw validationError("Recommendation action_payload must be an object.");
   if (typeof recommendation.confidence !== "number" || recommendation.confidence < 0 || recommendation.confidence > 1) throw validationError("Recommendation confidence must be a number from 0 to 1.");
-  if (!isStringArray(recommendation.source_ids)) throw validationError("Recommendation requires provenance in source_ids.");
+  if (!((allowEmptySourceIds && Array.isArray(recommendation.source_ids) && recommendation.source_ids.length === 0) || isStringArray(recommendation.source_ids))) throw validationError("Recommendation requires provenance in source_ids.");
   return recommendation;
 }
 
 function validateDeterministicRecommendationContext(recommendation) {
   if (!isObject(recommendation)) throw validationError("Deterministic recommendation context must be an object.");
   for (const field of deterministicRecommendationFields) if (!(field in recommendation)) throw validationError(`Deterministic recommendation context requires ${field}.`);
-  validateRecommendation(recommendation);
+  validateRecommendation(recommendation, { allowEmptySourceIds: recommendation.rule === "no_unresolved_issue" });
   if (!isNonEmptyString(recommendation.rule)) throw validationError("Deterministic recommendation context requires a rule.");
   return recommendation;
 }

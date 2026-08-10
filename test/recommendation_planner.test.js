@@ -30,3 +30,21 @@ test("active-work suppression is scoped to the selected issue identity, with an 
   const newEvidence = planRecommendation(base({ assumptions: [issue], evidence: [{ id: "e", created_at: "2026-01-03T00:00:00Z" }], assumption_evidence: [{ assumption_id: "a", evidence_id: "e" }], tasks: [{ id: "legacy", issue_text: "Validate recurring billing", status: "doing", created_at: "2026-01-02T00:00:00Z" }] }));
   assert.equal(newEvidence.recommendation.state, "task");
 });
+
+test("active work suppresses replacement tasks and experiments across risk bands", () => {
+  const lowRisk = base({
+    assumptions: [{ id: "a", statement: "Known low-risk issue", status: "untested", importance: 2, uncertainty: 2, risk_score: 20 }],
+    evidence: [{ id: "e", created_at: "2026-01-01T00:00:00Z" }],
+    assumption_evidence: [{ assumption_id: "a", evidence_id: "e" }],
+    tasks: [{ id: "t", assumption_id: "a", status: "doing", created_at: "2026-01-02T00:00:00Z" }]
+  });
+  assert.equal(planRecommendation(lowRisk).recommendation.rule, "active_work");
+  assert.equal(planRecommendation(lowRisk).recommendation.state, "wait");
+
+  const critical = base({
+    assumptions: [{ id: "a", statement: "Critical outside-world issue", status: "untested", importance: 5, uncertainty: 5, risk_score: 90 }],
+    experiments: [{ id: "x", assumption_id: "a", status: "running", started_at: "2026-01-02T00:00:00Z" }]
+  });
+  assert.equal(planRecommendation(critical).recommendation.rule, "active_work");
+  assert.equal(planRecommendation(critical).recommendation.state, "wait");
+});
