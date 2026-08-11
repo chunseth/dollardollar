@@ -120,8 +120,8 @@ This is the highest-value new integration scenario. It should run against the re
 
 The scenario passes only when all of the following are true:
 
-- The checkpoint includes a concrete next action, a named owner (the founder or a specified participant), an observable outcome, and a time or completion boundary.
-- The next action is linked to a consequential uncertainty or assumption; a generic “keep exploring” recommendation does not qualify.
+- The checkpoint can formulate a credible, testable next-action candidate. That single candidate contains a primary consequential uncertainty or assumption, a prioritized action, a named owner (the founder or a specified participant), expected evidence, and an observable completion boundary.
+- Actionability is assessed on the coherence of the proposed candidate; it is not satisfied by independently populating four discovery fields or by producing a generic “keep exploring” recommendation.
 - The experiment or task is linked back to the assumption it is intended to test and forward to the evidence it produces.
 - Founder-reported results are durable even when extraction, enrichment, or replanning is retried.
 - Uncertain, conflicting, or ambiguous results remain pending review rather than silently changing task, experiment, memory, or roadmap state.
@@ -132,7 +132,7 @@ The scenario passes only when all of the following are true:
 
 ## Actionability-based checkpoint criteria
 
-The existing readiness threshold remains useful as a discovery signal, but it is not sufficient for product completion. A checkpoint is successful only when it combines sufficient understanding with a credible learning action.
+The existing readiness threshold remains useful as a discovery signal, but it is not sufficient for product completion. A checkpoint is successful only when the system can formulate a credible, testable next action from the available understanding. Actionability is a property of that proposed action candidate, not a second checklist of independent discovery requirements.
 
 ### Discovery readiness
 
@@ -142,11 +142,18 @@ The existing readiness threshold remains useful as a discovery signal, but it is
 
 ### Actionability readiness
 
-- There is a prioritized next move that can be started now.
-- The move is designed to reduce a consequential uncertainty, validate an assumption, or obtain evidence for a decision.
-- The expected evidence and interpretation question are explicit.
-- The completion report has a defined shape: what was tried, with whom or what, what happened, and what evidence supports the result.
-- The result will enter a review boundary before material belief or roadmap changes are applied.
+Ask one question: **Can I formulate a credible, testable next action?**
+
+If yes, the proposed action internally carries the properties needed to execute and learn from it:
+
+- one primary consequential uncertainty or assumption it is intended to reduce or test;
+- a prioritized move that can be started now;
+- an owner;
+- expected evidence and an interpretation question;
+- an observable completion boundary and a defined shape for the founder’s completion report; and
+- a review boundary before material belief or roadmap changes are applied.
+
+These are properties of one coherent action candidate. They should not be treated as separate discovery gates that block the checkpoint when the system can already formulate a credible action from the combined context.
 
 Naming or snapshot confirmation alone should not count as a successful product checkpoint. The checkpoint may still be useful as an intermediate UI state, but the completion metric should count only an actionable checkpoint that can initiate the lifecycle below.
 
@@ -164,13 +171,13 @@ The lifecycle is incomplete if evidence is stored without interpretation review,
 
 ## Revised test-plan emphasis
 
-The existing 14 test themes and their current status remain the baseline. New work should emphasize cross-boundary behavior in this order:
+The existing 14 test themes and their current status remain the baseline. New work should emphasize cross-boundary behavior in this order. The golden-path test should be created as an executable skeleton in Phase 0, then progressively made more complete and more passing as the product lifecycle is implemented:
 
-1. The Golden Path Product Test above, including a positive, negative, and inconclusive founder-reported result.
-2. Actionable checkpoint creation: a vague idea becomes a prioritized, linked, evidence-producing next move.
-3. Review safety: ambiguous or conflicting completion reports remain pending and do not silently mutate canonical state.
-4. Belief and roadmap updates: approved evidence changes the relevant state and causes a materially different next recommendation.
-5. Reliability under the lifecycle: founder response persistence, retries, idempotency, concurrent submissions, and delayed or failed enrichment preserve the same links and outcome.
+1. **Phase 0 — test skeleton:** define the deterministic vague-idea fixture, positive/negative/inconclusive result variants, durable-link assertions, review boundaries, and the before/after recommendation comparison. The skeleton may initially expose expected failures, but it must run and make the missing product behavior visible.
+2. **First green slice — actionable checkpoint:** make the vague idea reach a prioritized, linked, evidence-producing next move.
+3. **Second green slice — evidence and review:** make founder-reported results durable, ambiguity-safe, and reviewable without silently mutating canonical state.
+4. **Third green slice — belief update and replan:** make approved evidence update the relevant state and produce a materially different next recommendation.
+5. **Hardening slice — reliability:** verify response persistence, retries, idempotency, concurrent submissions, and delayed or failed enrichment preserve the same links and outcome across the full lifecycle.
 
 Component tests should continue to support these behaviors, but coverage should be reported separately for “component correctness” and “golden-path product completion.” A passing planner unit test must not be treated as proof that the founder can complete the loop.
 
@@ -304,14 +311,23 @@ The repository currently has test coverage but no outcome instrumentation. These
 
 ## Recommended delivery order
 
-### Priority 1: Prove the golden path and make it safe
+### Phase 0: Create the executable golden-path test skeleton
 
-- Implement the end-to-end Golden Path Product Test, including a materially different next recommendation after approved evidence.
-- Change checkpoint completion from discovery/snapshot readiness to actionability readiness.
-- Replace regex-only completion detection with structured intent extraction plus an ambiguity state.
-- Ensure every material status change has a founder-review path and provenance.
-- Add latency, job, plan-item, checkpoint, evidence, review, and replan events.
-- Add concurrent submission ordering tests and retry/idempotency coverage across the full lifecycle.
+- Add a deterministic fixture in which a founder starts with a vague startup idea.
+- Exercise the complete intended journey: checkpoint, consequential uncertainty, linked experiment, founder result, evidence extraction, review, approved belief change, replan, and materially different next recommendation.
+- Include positive, negative, and inconclusive result variants so the contract covers learning rather than only success.
+- Assert durable links between each lifecycle state and compare recommendation meaning before and after the reviewed result.
+- Mark unimplemented assertions as explicit expected failures or staged gates; do not remove them to obtain a green test run.
+
+### Priority 1: Progressively make the golden path pass
+
+- First make checkpoint completion depend on actionability, not only discovery or snapshot readiness.
+- Then make linked experiment/task creation and evidence-bearing founder reports pass.
+- Then replace regex-only completion detection with structured intent extraction plus an ambiguity state.
+- Then ensure every material status change has a founder-review path and provenance.
+- Finally make approved belief changes update canonical state and produce a materially different next recommendation.
+- Add latency, job, plan-item, checkpoint, evidence, review, and replan events as each stage becomes observable.
+- Add concurrent submission ordering tests and retry/idempotency coverage as lifecycle stages become operational.
 
 ### Priority 2: Make reviewed evidence trustworthy in memory
 
