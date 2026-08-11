@@ -48,3 +48,26 @@ test("Browser code does not reference OpenAI credentials or make direct OpenAI c
   assert.doesNotMatch(browserFiles, /OPENAI_API_KEY/i);
   assert.doesNotMatch(browserFiles, /api\.openai\.com/i);
 });
+
+test("Checkpoint review requires red AI-organized fields and presents gaps as a side rail", () => {
+  assert.match(app, /checkpoint-review-layout/);
+  assert.match(app, /checkpoint-name-suggestion/);
+  assert.match(app, /data-checkpoint-required/);
+  assert.match(app, /multiline=new Set\(\[\"short_description\",\"problem_statement\",\"solution_summary\",\"founder_goal\",\"pricing_hypothesis\"\]\)/);
+  assert.match(app, /checkpoint-submit/);
+  assert.match(app, /confirm-checkpoint-field/);
+  assert.match(app, /markCheckpointFieldReviewed/);
+  assert.match(app, /classList\.contains\("ai-organized"\)/);
+  assert.match(browserFiles, /\.checkpoint-field\.ai-organized/);
+  assert.match(browserFiles, /\.checkpoint-gaps-panel/);
+});
+
+test("Company memory uses concise summaries and hides historical conversation sources", () => {
+  const memorySection = app.slice(app.indexOf("function memoryWorkspace"), app.indexOf("function evidence"));
+  assert.match(app, /function memoryItemSummary/);
+  assert.match(memorySection, /class="memory-summary"/);
+  assert.match(app, /details class="memory-sources"/);
+  assert.match(app, /Show \$\{sources\.length\} historical conversation/);
+  assert.doesNotMatch(memorySection, /Source \$\{esc\(\(item\.source_turn_ids/);
+  assert.match(browserFiles, /\.memory-sources\[open\]/);
+});

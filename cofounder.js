@@ -227,12 +227,105 @@ async function persistConversationTurn(projectId, message, userId = null, { topi
   });
 }
 
+async function recreateContextPacket(client, projectId, founderTurnId, assistantTurnId = null) {
+  const existing = (await client.query("SELECT context_packets.* FROM conversation_turns JOIN context_packets ON context_packets.id=conversation_turns.context_packet_id WHERE conversation_turns.id=$1 AND conversation_turns.project_id=$2", [founderTurnId, projectId])).rows[0];
+  if (existing) return existing;
+  const memory = await fullMemory(projectId, client);
+  const packet = buildContextPacket(memory);
+  const plan = await activePlan(projectId, client);
+  const packetData = {
+    ...packet.data,
+    response_plan: (plan?.items || []).filter(item => item.status === "pending").slice(0, 5),
+    cofounder_mode: plan?.mode || "explorer",
+    recovery: { source: "missing_context_packet", founder_turn_id: founderTurnId }
+  };
+  const row = (await client.query("INSERT INTO context_packets (project_id,purpose,data,included_memory_record_ids) VALUES ($1,'chat_turn_recovery',$2,$3) RETURNING *", [projectId, packetData, packet.included_memory_record_ids])).rows[0];
+  const turnIds = [founderTurnId, assistantTurnId].filter(Boolean);
+  await client.query("UPDATE conversation_turns SET context_packet_id=$1 WHERE project_id=$2 AND id=ANY($3::uuid[]) AND context_packet_id IS NULL", [row.id, projectId, turnIds]);
+  return row;
+}
+
 async function persistDiscoveryFacts(client, projectId, facts, sourceTurnId) {
   for (const fact of facts || []) {
     const existing = (await client.query("SELECT id FROM discovery_facts WHERE project_id=$1 AND field_key=$2 AND status='current' FOR UPDATE", [projectId, fact.field])).rows[0];
     if (existing) await client.query("UPDATE discovery_facts SET status='superseded', updated_at=now() WHERE id=$1", [existing.id]);
     await client.query("INSERT INTO discovery_facts (project_id,field_key,statement,classification,confidence,source_turn_id,provenance) VALUES ($1,$2,$3,$4,$5,$6,$7)", [projectId, fact.field, fact.statement.trim(), fact.classification, fact.confidence, sourceTurnId, { source_ids: fact.source_ids, source: "cofounder_chat" }]);
   }
+}
+
+const recoverableDiscoveryFields = new Set(["customer_segment", "problem", "context", "current_workaround", "desired_outcome", "solution", "buyer", "first_dollar_offer"]);
+const recoverableDiscoveryClassifications = new Set(["founder_statement", "inference", "assumption", "evidence_observation"]);
+const recoverableDiscoveryConfidence = new Set(["low", "medium", "high"]);
+
+function recoveredDiscoveryFacts(turn) {
+  const payload = turn?.structured_payload || {};
+  const facts = payload.enrichment?.discovery_facts || payload.discovery_facts || [];
+  return Array.isArray(facts) ? facts.filter(fact => recoverableDiscoveryFields.has(fact?.field) && typeof fact.statement === "string" && fact.statement.trim() && recoverableDiscoveryClassifications.has(fact.classification) && recoverableDiscoveryConfidence.has(fact.confidence)).map(fact => ({
+    field: fact.field,
+    statement: fact.statement.trim(),
+    classification: fact.classification,
+    confidence: fact.confidence,
+    source_ids: Array.isArray(fact.source_ids) ? fact.source_ids : []
+  })) : [];
+}
+
+async function restoreDiscoveryState(projectId) {
+  return transaction(async client => {
+    const project = (await client.query("SELECT * FROM projects WHERE id=$1 FOR UPDATE", [projectId])).rows[0];
+    if (!project || project.onboarding_state !== "discovery") return { restored_count: 0, checkpoint_status: project?.checkpoint_status || null };
+    const missingPackets = (await client.query(`
+      SELECT founder.id AS founder_turn_id, founder.session_id, founder.content,
+             ai.id AS assistant_turn_id, ai.structured_payload
+      FROM conversation_turns founder
+      JOIN conversation_turns ai
+        ON ai.session_id=founder.session_id
+       AND ai.turn_no=founder.turn_no + 1
+       AND ai.actor_type='ai'
+      WHERE founder.project_id=$1
+        AND founder.actor_type='founder'
+        AND founder.context_packet_id IS NULL
+      ORDER BY founder.turn_no ASC
+    `, [projectId])).rows;
+    for (const turn of missingPackets) {
+      const packet = await recreateContextPacket(client, projectId, turn.founder_turn_id, turn.assistant_turn_id);
+      const job = (await client.query("SELECT id,status,payload FROM background_jobs WHERE project_id=$1 AND job_type='turn_enrichment' AND payload->>'founder_turn_id'=$2 ORDER BY created_at DESC LIMIT 1", [projectId, turn.founder_turn_id])).rows[0];
+      const hasEnrichment = Boolean(turn.structured_payload?.enrichment);
+      if (job) {
+        const shouldQueue = !hasEnrichment && job.status !== "running";
+        await client.query("UPDATE background_jobs SET payload=payload || $2::jsonb, status=CASE WHEN $3 THEN 'queued' ELSE status END, attempts=CASE WHEN $3 THEN 0 ELSE attempts END, available_at=CASE WHEN $3 THEN now() ELSE available_at END, last_error=CASE WHEN $3 THEN NULL ELSE last_error END, updated_at=now() WHERE id=$1", [job.id, JSON.stringify({ context_packet_id: packet.id }), shouldQueue]);
+      } else if (!hasEnrichment) {
+        await enqueueJob(projectId, "turn_enrichment", { project_id: projectId, user_id: null, founder_turn_id: turn.founder_turn_id, assistant_turn_id: turn.assistant_turn_id, context_packet_id: packet.id, session_id: turn.session_id, message: turn.content }, `recovery:${turn.founder_turn_id}`, client);
+      }
+    }
+    const currentFields = new Set((await client.query("SELECT field_key FROM discovery_facts WHERE project_id=$1 AND status='current'", [projectId])).rows.map(row => row.field_key));
+    const missingFields = new Set([...recoverableDiscoveryFields].filter(field => !currentFields.has(field)));
+    const assistantTurns = (await client.query(`
+      SELECT founder.id AS founder_turn_id, ai.structured_payload
+      FROM conversation_turns founder
+      JOIN conversation_turns ai
+        ON ai.session_id=founder.session_id
+       AND ai.turn_no=founder.turn_no + 1
+       AND ai.actor_type='ai'
+      WHERE founder.project_id=$1 AND founder.actor_type='founder'
+      ORDER BY founder.turn_no ASC
+    `, [projectId])).rows;
+    const restored = [];
+    for (const turn of assistantTurns) {
+      const facts = recoveredDiscoveryFacts({ structured_payload: turn.structured_payload });
+      for (const fact of facts) {
+        if (!missingFields.has(fact.field)) continue;
+        await persistDiscoveryFacts(client, projectId, [fact], turn.founder_turn_id);
+        await saveMemoryItems(client, extractWorkingItems({ facts: [fact], sourceTurnId: turn.founder_turn_id, projectId }));
+        restored.push(fact.field);
+      }
+    }
+    const memory = await fullMemory(projectId, client);
+    const readiness = discoveryPlan(memory).checkpoint_ready;
+    const checkpointStatus = readiness ? "ready" : "not_ready";
+    const metadata = { ...(project.checkpoint_metadata || {}), readiness, ...(restored.length ? { recovered_at: new Date().toISOString(), recovered_fact_count: restored.length } : {}) };
+    await client.query("UPDATE projects SET checkpoint_status=$2, checkpoint_metadata=$3 WHERE id=$1", [projectId, checkpointStatus, metadata]);
+    return { restored_count: restored.length, restored_fields: restored, checkpoint_status: checkpointStatus };
+  });
 }
 
 function stableJson(value) {
@@ -351,9 +444,10 @@ async function handleFounderMessage(projectId, userId, message, options = {}) {
 async function handleEnrichmentJob(payload, { extractor = callOpenAIModel, proposer = proposeChangeSet } = {}) {
   const packetResult = await query("SELECT * FROM context_packets WHERE id=$1 AND project_id=$2", [payload.context_packet_id, payload.project_id]);
   const founderResult = await query("SELECT * FROM conversation_turns WHERE id=$1 AND project_id=$2 AND actor_type='founder'", [payload.founder_turn_id, payload.project_id]);
-  if (!packetResult.rows[0] || !founderResult.rows[0]) throw new Error("Enrichment source conversation was not found.");
-  const contextPacket = packetResult.rows[0];
+  if (!founderResult.rows[0]) throw new Error("Enrichment source conversation was not found.");
   const founderTurn = founderResult.rows[0];
+  const contextPacket = packetResult.rows[0] || await transaction(async client => recreateContextPacket(client, payload.project_id, founderTurn.id, payload.assistant_turn_id));
+  founderTurn.context_packet_id = contextPacket.id;
   let raw = await extractor({ projectId: payload.project_id, userId: payload.user_id, message: payload.message, contextPacket, founderTurn });
   const plan = { recommendation: { ...contextPacket.data.deterministic_recommendation, issue: contextPacket.data.top_unresolved_issue || null }, ranked_issues: contextPacket.data.ranked_unresolved_issues || [], selected_issue: contextPacket.data.top_unresolved_issue || null };
   const output = normalizeCofounderOutput(raw, contextPacket, founderTurn, plan);
@@ -399,4 +493,4 @@ async function handleEnrichmentJob(payload, { extractor = callOpenAIModel, propo
   return output;
 }
 
-module.exports = { handleFounderMessage, handleEnrichmentJob, callCofounderModel, callFastCofounderModel, callOpenAIModel, normalizeCofounderOutput, persistConversationTurn, idempotencyKey, fullMemory, persistDiscoveryFacts };
+module.exports = { handleFounderMessage, handleEnrichmentJob, callCofounderModel, callFastCofounderModel, callOpenAIModel, normalizeCofounderOutput, persistConversationTurn, idempotencyKey, fullMemory, persistDiscoveryFacts, restoreDiscoveryState };

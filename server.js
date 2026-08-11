@@ -6,7 +6,7 @@ const { query, transaction } = require("./db");
 const { createDraft, createPlan, normalizeDraft, fields: onboardingFields, industries, industryModules, revenuePathFields, projectTitle } = require("./onboarding");
 const { buildProjectContext } = require("./context");
 const { synthesizeCheckpoint } = require("./checkpoint_synthesis");
-const { handleFounderMessage, callOpenAIModel, callFastCofounderModel } = require("./cofounder");
+const { handleFounderMessage, callOpenAIModel, callFastCofounderModel, restoreDiscoveryState } = require("./cofounder");
 const { activePlan, pendingPlanItems, listMemoryItems, drainJobs, ensurePlan } = require("./operating_loop");
 const { recalculateRecommendation, recommendationHistory } = require("./recommendations");
 const { createBeliefFromAssumption, appendBeliefVersion, linkEvidenceToBeliefVersion } = require("./beliefs");
@@ -71,6 +71,13 @@ function appliedChangeSetAffectsRecommendation(changeSet) {
 async function readBody(request) { let body = ""; for await (const chunk of request) { body += chunk; if (body.length > 1_000_000) throw new Error("Request body is too large"); } try { return body ? JSON.parse(body) : {}; } catch { const error = new Error("Request body must be valid JSON"); error.status = 400; throw error; } }
 async function log(client, projectId, actorType, eventType, entityType, entityId, summary, payload = {}) { return (await client.query("INSERT INTO event_log (project_id, actor_type, event_type, entity_type, entity_id, summary, payload) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id", [projectId, actorType, eventType, entityType, entityId, summary, payload])).rows[0].id; }
 async function ownedProject(projectId, owner) { const result = await query("SELECT * FROM projects WHERE id=$1 AND user_id=$2", [projectId, owner]); return result.rows[0]; }
+async function attachMemorySourceTurns(items, projectId, executor = { query }) {
+  const sourceIds = [...new Set(items.flatMap(item => Array.isArray(item.source_turn_ids) ? item.source_turn_ids.map(String) : []))];
+  if (!sourceIds.length) return items.map(item => ({ ...item, source_turns: [] }));
+  const turns = (await executor.query("SELECT id, actor_type, content, created_at FROM conversation_turns WHERE project_id=$1 AND id::text = ANY($2::text[]) ORDER BY created_at ASC", [projectId, sourceIds])).rows;
+  const byId = new Map(turns.map(turn => [String(turn.id), turn]));
+  return items.map(item => ({ ...item, source_turns: (item.source_turn_ids || []).map(id => byId.get(String(id))).filter(Boolean) }));
+}
 async function fullMemory(projectId, executor = { query }, includeConversation = false) {
   const project = await executor.query("SELECT * FROM projects WHERE id=$1", [projectId]);
   const assumptions = await executor.query("SELECT * FROM assumptions WHERE project_id=$1 ORDER BY risk_score DESC, created_at", [projectId]);
@@ -125,6 +132,7 @@ async function chatHistory(projectId, sessionId = null) {
   return (await query(`SELECT id, session_id, context_packet_id, turn_no, actor_type, content, model, prompt_version, structured_payload, created_at FROM conversation_turns WHERE project_id=$1${filter} ORDER BY created_at ASC, turn_no ASC`, params)).rows;
 }
 async function chatDiscovery(projectId, sessionId = null) {
+  await restoreDiscoveryState(projectId);
   const memory = await fullMemory(projectId);
   const packet = buildProjectContext(memory);
   const processing = (await query("SELECT id,job_type,status,attempts,last_error,created_at,updated_at FROM background_jobs WHERE project_id=$1 ORDER BY created_at DESC LIMIT 1", [projectId])).rows[0] || null;
@@ -248,6 +256,7 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
   }
   if (parts[3] === "chat" && parts.length === 4 && method === "GET") { const sessionId = url.searchParams.get("session_id") || null; return send(response, 200, { turns: await chatHistory(projectId, sessionId), ...(await chatDiscovery(projectId, sessionId)) }); }
   if (parts[3] === "checkpoint" && parts[4] === "synthesis" && parts.length === 5 && method === "GET") {
+    await restoreDiscoveryState(projectId);
     const memory = await fullMemory(projectId);
     const synthesis = synthesizeCheckpoint(memory);
     if (existingProject.onboarding_state === "discovery" && !synthesis.readiness) return fail(response, 422, "Keep exploring the company shape before reviewing this snapshot.", { next_gap: synthesis.unresolved_gaps[0] || null });
@@ -289,13 +298,14 @@ async function api(request, response, url, generatePlan = createPlan, generateAs
     return send(response, 201, result);
   }
   if (parts[3] === "recommendation-queue" && parts.length === 4 && method === "GET") return send(response, 200, { plan: await activePlan(projectId), items: await pendingPlanItems(projectId) });
-  if (parts[3] === "memory-items" && parts.length === 4 && method === "GET") return send(response, 200, { memory_items: await listMemoryItems(projectId, { aspect: url.searchParams.get("aspect"), confidence: url.searchParams.get("confidence") }) });
+  if (parts[3] === "memory-items" && parts.length === 4 && method === "GET") { const items = await listMemoryItems(projectId, { aspect: url.searchParams.get("aspect"), confidence: url.searchParams.get("confidence") }); return send(response, 200, { memory_items: await attachMemorySourceTurns(items, projectId) }); }
   if (parts[3] === "roadmap-graph" && parts.length === 4 && method === "GET") return send(response, 200, { nodes: (await query("SELECT * FROM roadmap_nodes WHERE project_id=$1 ORDER BY visible DESC, position NULLS LAST, created_at", [projectId])).rows, edges: (await query("SELECT * FROM roadmap_edges WHERE project_id=$1", [projectId])).rows });
   if (parts[3] === "checkpoint" && parts[4] === "naming" && parts.length === 5 && method === "GET") {
+    await restoreDiscoveryState(projectId);
     const synthesis = synthesizeCheckpoint(await fullMemory(projectId));
     return send(response, 200, { ready: synthesis.readiness, suggestion: synthesis.company_name_suggestion, naming_directions: synthesis.company_name_suggestion ? [synthesis.company_name_suggestion.value, `${synthesis.company_name_suggestion.value} Labs`, `${synthesis.company_name_suggestion.value} Works`] : [] });
   }
-  if (parts[3] === "memory" && method === "GET") return send(response, 200, await fullMemory(projectId));
+  if (parts[3] === "memory" && method === "GET") { const memory = await fullMemory(projectId); memory.memory_items = await attachMemorySourceTurns(memory.memory_items || [], projectId); return send(response, 200, memory); }
   if (parts[3] === "plan" && method === "POST") {
     const assumptions = (await query("SELECT id, statement, category, priority, subcategory FROM assumptions WHERE project_id=$1 ORDER BY risk_score DESC, created_at", [projectId])).rows;
     const existing = await query("SELECT 1 FROM event_log WHERE project_id=$1 AND actor_type='ai' AND event_type='generated' AND entity_type='validation_plan' LIMIT 1", [projectId]);
